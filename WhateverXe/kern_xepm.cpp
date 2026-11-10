@@ -35,7 +35,9 @@ static inline uint64_t xpRdmsr(uint32_t m) { uint32_t lo, hi; asm volatile("rdms
 static inline void xpWrmsr(uint32_t m, uint64_t v) { asm volatile("wrmsr" : : "c"(m), "a"((uint32_t)v), "d"((uint32_t)(v >> 32))); }
 
 static bool gXpOn = false;
-static int gXpHwp = 0, gXpEpp = -1;                 // sysctl debug.xepm.hwp / .epp (root)
+static int gXpHwp = 0, gXpEpp = -1;
+static int gXpDes = -1, gXpMin = -1;                 // sysctl debug.xepm.desired / .min (root), -1 = XCPM's
+static uint64_t gXpLastReq = 0;                      // last IA32_HWP_REQUEST written (any CPU)                 // sysctl debug.xepm.hwp / .epp (root)
 static int gXpEet = 0, gXpCst = 0, gXpD3 = 0, gXpRoute = 0;   // status
 static mach_vm_address_t gXpOrgSetMult = 0, gXpCstPtr = 0;
 
@@ -48,13 +50,19 @@ static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) 
 		if (v & (1ULL << 42)) return r;   // package control: leave it alone
 		const uint32_t hi = (uint32_t)(xpRdmsr(0x771) & 0xff), max = (uint32_t)(v >> 8) & 0xff, des = (uint32_t)(v >> 16) & 0xff;
 		uint64_t nv = v;
+		uint32_t mx = max, d = des, mn = (uint32_t)v & 0xff;
 		if (max && hi > max && hi < 0xff) {
-			uint32_t d = des ? (des * hi + max / 2) / max : 0;
+			d = des ? (des * hi + max / 2) / max : 0;
 			if (d > hi) d = hi;
-			nv = (nv & ~0xFFFF00ULL) | ((uint64_t)hi << 8) | ((uint64_t)d << 16);
+			mx = hi;
 		}
+		// desired 0 = autonomous HWP: the core picks its own frequency, steered by EPP.
+		if (gXpDes >= 0) d = (uint32_t)gXpDes > mx ? mx : (uint32_t)gXpDes;
+		if (gXpMin >= 0) mn = (uint32_t)gXpMin > mx ? mx : (uint32_t)gXpMin;
+		nv = (nv & ~0xFFFFFFULL) | mn | ((uint64_t)mx << 8) | ((uint64_t)d << 16);
 		if (gXpEpp >= 0) nv = (nv & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
 		if (nv != v) xpWrmsr(0x774, nv);
+		gXpLastReq = nv;
 	}
 	return r;
 }
@@ -123,6 +131,9 @@ static void xpApply(thread_call_param_t, thread_call_param_t) {
 SYSCTL_NODE(_debug, OID_AUTO, xepm, CTLFLAG_RW, 0, "WhateverXe XE-PM");
 SYSCTL_INT(_debug_xepm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
 SYSCTL_INT(_debug_xepm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
+SYSCTL_INT(_debug_xepm, OID_AUTO, desired, CTLFLAG_RW, &gXpDes, 0, "HWP desired perf override, 0 = autonomous, -1 = XCPM's");
+SYSCTL_INT(_debug_xepm, OID_AUTO, min, CTLFLAG_RW, &gXpMin, 0, "HWP minimum perf override, -1 = XCPM's");
+SYSCTL_QUAD(_debug_xepm, OID_AUTO, last_req, CTLFLAG_RD, &gXpLastReq, "last IA32_HWP_REQUEST written");
 SYSCTL_INT(_debug_xepm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
 SYSCTL_INT(_debug_xepm, OID_AUTO, cst, CTLFLAG_RD, &gXpCst, 0, "1 = C8/C10 on");
 SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
@@ -153,6 +164,9 @@ void xePmInstall(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_xepm);
 	sysctl_register_oid(&sysctl__debug_xepm_hwp);
 	sysctl_register_oid(&sysctl__debug_xepm_epp);
+	sysctl_register_oid(&sysctl__debug_xepm_desired);
+	sysctl_register_oid(&sysctl__debug_xepm_min);
+	sysctl_register_oid(&sysctl__debug_xepm_last_req);
 	sysctl_register_oid(&sysctl__debug_xepm_eet_off);
 	sysctl_register_oid(&sysctl__debug_xepm_cst);
 	sysctl_register_oid(&sysctl__debug_xepm_d3);
