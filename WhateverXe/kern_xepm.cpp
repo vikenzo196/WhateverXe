@@ -143,6 +143,9 @@ void xePmInstall(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-wex-pm")) return;
 	gXpOn = true;
 	gXpEpp = 0;
+	// Autonomous HWP (desired 0): XCPM's desired hint kept busy P-cores near 1.5 GHz, so
+	// WindowServer missed 120 Hz vblanks. sysctl debug.xepm.desired=-1 restores XCPM's value.
+	gXpDes = 0;
 	gXpCstPtr = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_cstate_table");
 	patcher.clearError();
 	const mach_vm_address_t base = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_enable_pstate_ctrs");
