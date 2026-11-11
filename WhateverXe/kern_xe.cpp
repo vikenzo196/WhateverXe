@@ -87,6 +87,7 @@
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
+#include "kern_tgl_recovery_post.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -334,11 +335,73 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+// Fork: post-reset engine state (TGLRecoveryPost). Fixed storage, no
+// allocation in the recovery callback; the thread call is allocated at install.
+namespace {
+TGLRecoveryPost::Record tglRecoveryPost[TGLRecoveryPost::Recoveries] {};
+uint32_t tglRecoveryPostCount {};
+mach_vm_address_t tglRecoverySafeForceWake {};
+thread_call_t tglRecoveryPostCall {};
+volatile uint32_t tglRecoveryPostSlot=UINT32_MAX, tglRecoveryPostNext=0;
+const uint32_t tglRecoveryPostDelaysMs[TGLRecoveryPost::Samples] {0,20,200,1000,3000};
+bool tglRecoveryPostSerialize(void *,void *,OSSerialize *serializer) {
+	auto out=OSData::withBytes(tglRecoveryPost,sizeof(tglRecoveryPost));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglRecoveryPostSample(unsigned slot,unsigned sample) {
+	if (slot>=TGLRecoveryPost::Recoveries || sample>=TGLRecoveryPost::Samples) return;
+	auto &r=tglRecoveryPost[slot];
+	if (!tglRecoverySafeForceWake) return;
+	// Resolve the global accelerator/MMIO once, inside the recovery callback
+	// where the ring is known live; later thread-call samples never touch it.
+	if (sample==0) {
+		auto ring=reinterpret_cast<uint8_t *>(r.ring);
+		if (!ring) return;
+		r.accelerator=reinterpret_cast<uintptr_t>(*reinterpret_cast<void **>(ring+0x10));
+		r.mmio=reinterpret_cast<uintptr_t>(*reinterpret_cast<uint8_t **>(ring+0x50));
+	}
+	auto accelerator=reinterpret_cast<void *>(r.accelerator);
+	auto mmio=reinterpret_cast<uint8_t *>(r.mmio);
+	if (!accelerator || !mmio || (r.mmio>>47)!=0x1FFFF || (r.accelerator>>47)!=0x1FFFF) return;
+	using Wake=void (*)(void *,bool,unsigned);
+	auto wake=reinterpret_cast<Wake>(tglRecoverySafeForceWake);
+	wake(accelerator,true,7);
+	for (unsigned i=0;i<TGLRecoveryPost::RegisterCount;++i)
+		r.value[sample][i]=*reinterpret_cast<volatile uint32_t *>(mmio+TGLRecoveryPost::Registers[i]);
+	wake(accelerator,false,7);
+	r.time[sample]=mach_absolute_time();
+	__atomic_or_fetch(&r.valid,1ULL<<sample,__ATOMIC_RELEASE);
+}
+void tglRecoveryPostWork(thread_call_param_t,thread_call_param_t) {
+	const auto slot=__atomic_load_n(&tglRecoveryPostSlot,__ATOMIC_ACQUIRE);
+	const auto sample=__atomic_load_n(&tglRecoveryPostNext,__ATOMIC_ACQUIRE);
+	if (slot>=TGLRecoveryPost::Recoveries || sample==0 || sample>=TGLRecoveryPost::Samples) return;
+	tglRecoveryPostSample(slot,sample);
+	if (sample+1<TGLRecoveryPost::Samples && __atomic_load_n(&tglRecoveryPostSlot,__ATOMIC_ACQUIRE)==slot) {
+		__atomic_store_n(&tglRecoveryPostNext,sample+1,__ATOMIC_RELEASE);
+		uint64_t deadline {};
+		clock_interval_to_deadline(tglRecoveryPostDelaysMs[sample+1]-tglRecoveryPostDelaysMs[sample],kMillisecondScale,&deadline);
+		thread_call_enter_delayed(tglRecoveryPostCall,deadline);
+	}
+}
+}
+
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
 	const auto result=TGLRecovery::resetAndResume(channel);
 	uint64_t after {};clock_get_uptime(&after);
+	const auto post=__atomic_fetch_add(&tglRecoveryPostCount,1,__ATOMIC_RELAXED);
+	if (post<TGLRecoveryPost::Recoveries) {
+		tglRecoveryPost[post].recovery=n+1;tglRecoveryPost[post].ring=result.ring;
+		tglRecoveryPostSample(post,0);
+		if (tglRecoveryPostCall) {
+			__atomic_store_n(&tglRecoveryPostSlot,post,__ATOMIC_RELEASE);
+			__atomic_store_n(&tglRecoveryPostNext,1U,__ATOMIC_RELEASE);
+			uint64_t deadline {};clock_interval_to_deadline(tglRecoveryPostDelaysMs[1],kMillisecondScale,&deadline);
+			thread_call_enter_delayed(tglRecoveryPostCall,deadline);
+		}
+	}
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
 		q[4]=reinterpret_cast<uintptr_t>(channel);q[5]=result.ring;
@@ -13106,6 +13169,16 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglRecoverySerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryLive",live);live->release();
 				}
+				// Fork: post-reset samples. Same qualified donor (SafeForceWake at 0x28C2A).
+				if (recoveryOK && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size)==address+0x28C2A) {
+					tglRecoverySafeForceWake=address+0x28C2A;
+					if (!tglRecoveryPostCall) tglRecoveryPostCall=thread_call_allocate(tglRecoveryPostWork,nullptr);
+					if (auto post=OSSerializer::forTarget(nullptr,tglRecoveryPostSerialize)) {
+						IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryPost",post);post->release();
+					}
+				}
+				patcher.clearError();
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryPostReady",tglRecoverySafeForceWake && tglRecoveryPostCall);
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
