@@ -79,6 +79,7 @@ unsigned streamCalls=0;OSObject *expectedPath=nullptr;
 uint32_t nativeStream(IOService*,IOService*,OSObject*,const void*);
 struct XE {
  static bool prepareDisplay13Wake(IOService*){return true;}
+ static bool display13EDPBlankPower(IOService*,uint32_t,uint32_t&){return false;}
  struct {unsigned dsi=1;}adlnOutputWiring;bool dsiStopAttempted=false,dsiResourcesReady=true;
  uintptr_t display13FramebufferEvent=0;bool dsiSystemWakeNotify=false,dsiPowerOffNotified=false;
  uint32_t dsiWakeIncomplete=0;
