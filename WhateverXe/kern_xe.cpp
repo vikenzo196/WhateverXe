@@ -16414,7 +16414,8 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   io.acquire();
   const auto ptr=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
   const auto mode=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
-  char reason[1800];
+  // Static: the IRQ frame has a 2304-byte budget; this path ends in panic.
+  static char reason[3600];
   size_t used=snprintf(reason,sizeof(reason),"CSB12-intake e=%u error=%u head=%u->%u sampledTail=%u mmioTail=%u ptr=%x mode=%x initMode=%x raw=%llx consumed=%llu HWS40..118=",
    io.engine,static_cast<unsigned>(error),initialHead,engine.state.head,io.sampledTail,io.mmioTail,
    ptr,mode,engine.modeAtInit,engine.lastRaw,engine.consumed);
@@ -16434,6 +16435,34 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   if (used<sizeof(reason)) snprintf(reason+used,sizeof(reason)-used," afterPtr=%x afterTail=%x",
    *reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg),
    *reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC));
+  // Fork: the reset trace lives only in memory; put it in the persisted panic.
+  // Per CSB12 engine: init count (resets). Per recovery record (newest 4):
+  // ring kind, GDRST mask, CS5 calls, replays, then for pre/atCS/afterCS/afterReset
+  // ring ctl 0x203c, HWS_PGA 0x2080, MI_MODE 0x209c, GFX_MODE 0x229c, CSB ptr 0x23a0,
+  // GDRST 0x941c, 0x2580.
+  used=strnlen(reason,sizeof(reason));
+  auto add=[&](const char *fmt,auto... args) {
+   if (used>=sizeof(reason)) return;
+   const int n=snprintf(reason+used,sizeof(reason)-used,fmt,args...);
+   if (n<0) return;
+   used=static_cast<size_t>(n)>=sizeof(reason)-used ? sizeof(reason) : used+n;
+  };
+  add(" RST act=%u slot=%d cache=%u/%u/%u/%u csbInit=",__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE),
+   static_cast<int>(tglResetSlot),tglResetCache.count,tglResetCache.valid,tglResetCache.refreshes,tglResetCache.replays);
+  for (unsigned i=0;i<arrsize(tglCSBEngines);++i) add("%llu,",tglCSBEngines[i].resets);
+  unsigned shown=0;
+  for (unsigned r=TGLRecoveryPost::Recoveries;r && shown<4;--r) {
+   const auto &t=tglResetTrace[r-1];if (!t.valid) continue;++shown;
+   add(" R%u v=%llx rec=%llu ring=%llx kind=%llx gd=%llx n=%llu eng=%llx cs=%llu fix=%llu/%llu cv=%llu",
+    r-1,t.valid,t.recovery,t.ring,t.ringKind,t.gdrstMask,t.listCount,t.engineFlags,t.csCalls,t.fixAtCS,t.fixAfterReset,t.cacheValid);
+   const uint32_t *samples[] {t.pre,t.atCS,t.afterCS,t.afterReset};
+   const char *names[] {"pre","cs","acs","end"};
+   const unsigned idx[] {3,8,9,15,16,20,23};
+   for (unsigned k=0;k<4;++k) {
+    add(" %s:",names[k]);
+    for (auto j:idx) add("%x,",samples[k][j]);
+   }
+  }
   const uint32_t words[] {static_cast<uint32_t>(engine.lastRaw),static_cast<uint32_t>(engine.lastRaw>>32)};
   tglHostCSBFatal(reason,words,streamer);
  }
