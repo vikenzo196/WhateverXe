@@ -339,6 +339,10 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 // Fork: post-reset engine state (TGLRecoveryPost). Fixed storage, no
 // allocation in the recovery callback; the thread call is allocated at install.
 namespace {
+// Fork diagnostic (WEXRecoveryRCSSoft): RCS streamer software state, defined
+// after tglCSBEngines. which: 0 pre, 1 after the RCS tail, 2 end, 3 +1 s, 4 +3 s.
+void tglRCSSoftSample(uint32_t slot,unsigned which);
+bool tglRCSSoftSerialize(void *,void *,OSSerialize *serializer);
 TGLRecoveryPost::Record tglRecoveryPost[TGLRecoveryPost::Recoveries] {};
 uint32_t tglRecoveryPostCount {};
 mach_vm_address_t tglRecoverySafeForceWake {};
@@ -372,6 +376,7 @@ void tglRecoveryPostSample(unsigned slot,unsigned sample) {
 	wake(accelerator,false,7);
 	r.time[sample]=mach_absolute_time();
 	__atomic_or_fetch(&r.valid,1ULL<<sample,__ATOMIC_RELEASE);
+	if (sample==3 || sample==4) tglRCSSoftSample(slot,sample);
 }
 void tglRecoveryPostWork(thread_call_param_t,thread_call_param_t) {
 	const auto slot=__atomic_load_n(&tglRecoveryPostSlot,__ATOMIC_ACQUIRE);
@@ -470,6 +475,7 @@ void XE::wrapTGLRecovery(void *channel) {
 			tglResetWake(true);
 			if (trace) tglResetSample(trace->pre);
 			if (trace) tglResetBCSSample(n,0);
+			tglRCSSoftSample(n,0);
 			TGLResetFix::refresh(tglResetCache,tglResetMMIO);
 			tglResetWake(false);
 			if (trace) {trace->cacheValid=tglResetCache.valid;__atomic_or_fetch(&trace->valid,1ULL,__ATOMIC_RELEASE);}
@@ -482,6 +488,7 @@ void XE::wrapTGLRecovery(void *channel) {
 		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAfterReset;
 		if (trace) {tglResetSample(trace->afterReset);__atomic_or_fetch(&trace->valid,8ULL,__ATOMIC_RELEASE);}
 		if (trace) tglResetBCSSample(static_cast<uint32_t>(trace->recovery-1),1);
+		if (trace) tglRCSSoftSample(static_cast<uint32_t>(trace->recovery-1),2);
 		tglResetWake(false);
 	});
 	__atomic_store_n(&tglResetActive,0U,__ATOMIC_RELEASE);
@@ -13380,6 +13387,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 						if (auto c=OSSerializer::forTarget(nullptr,tglResetBCSSerialize)) {
 							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryBCS",c);c->release();
 						}
+						if (auto c=OSSerializer::forTarget(nullptr,tglRCSSoftSerialize)) {
+							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryRCSSoft",c);c->release();
+						}
 					}
 				}
 				IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryTraceReady",resetFixOK);
@@ -16205,6 +16215,52 @@ struct TGLCSBEngine {
 // Exact donor kIGHwCsDesc has six 0x79-byte records, IDs0..5. The scheduler's
 // `index > 4` exit is AFTER construction, so it also constructs ID5.
 } tglCSBEngines[6];
+// Fork diagnostic, see the declaration. Memory reads only, each through
+// tglVMRead (nofault): no MMIO, locks, calls or writes. Layout per sample,
+// q[0] flags (bit n = field group read ok), q[1] streamer, q[2] port index
+// (+0x50), q[3..6] execlist ports (+0x30,+0x38,+0x40,+0x48), q[7..9] current
+// port element +0x8/+0x10/+0x18, q[10] its hardware context, q[11] context
+// +0xb8 (channel side), q[12] +0x20 index, q[13] +0x178 stamp|failures<<32,
+// q[14] pending queue, q[15] queue head (+0x4000), q[16] tail (+0x4048),
+// q[17] streamer +0x1c00 (CSB head at +0x1c04), q[18] +0x1c38 (flag +0x1c3c),
+// q[19] +0xc0 stamp interrupt bits, q[20..23] queue entry at head.
+struct TGLRCSSoftRecord {uint64_t valid; uint64_t q[5][24];};
+TGLRCSSoftRecord tglRCSSoft[8] {};
+bool tglRCSSoftSerialize(void *,void *,OSSerialize *serializer) {
+ auto out=OSData::withBytes(tglRCSSoft,sizeof(tglRCSSoft));if (!out) return false;
+ const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglRCSSoftSample(uint32_t slot,unsigned which) {
+ if (slot>=arrsize(tglRCSSoft) || which>=5) return;
+ auto streamer=reinterpret_cast<uint64_t>(tglCSBEngines[0].streamer);
+ if ((streamer>>47)!=0x1FFFF) return;
+ auto q=tglRCSSoft[slot].q[which];memset(q,0,sizeof(tglRCSSoft[slot].q[which]));
+ q[1]=streamer;
+ auto rd=[](uint64_t a,uint64_t &v) {return tglVMRead(a,v);};
+ uint64_t v=0;
+ if (rd(streamer+0x50,v)) {q[2]=v&0xFFFFFFFF;q[0]|=1;}
+ bool ports=true;
+ for (unsigned i=0;i<4;++i) ports=rd(streamer+0x30+i*8,q[3+i]) && ports;
+ if (ports) q[0]|=2;
+ const auto port=q[3+(q[2]&1)*2];
+ if ((port>>47)==0x1FFFF && rd(port+0x8,q[7]) && rd(port+0x10,q[8]) && rd(port+0x18,q[9]) && rd(port,q[10])) {
+  q[0]|=4;
+  if ((q[10]>>47)==0x1FFFF && rd(q[10]+0xB8,q[11]) && (q[11]>>47)==0x1FFFF &&
+      rd(q[11]+0x20,q[12]) && rd(q[11]+0x178,q[13])) {
+   q[0]|=8;
+   uint64_t ring=0,engine=0,base=0;
+   if (rd(q[11]+0x130,ring) && (ring>>47)==0x1FFFF && rd(ring+0x38,engine) && rd(streamer+0x20,base) &&
+       (base>>47)==0x1FFFF && rd(base+0xAA0+(engine&0x7)*8,q[14]) && (q[14]>>47)==0x1FFFF &&
+       rd(q[14]+0x4000,q[15]) && rd(q[14]+0x4048,q[16])) {
+    q[0]|=16;
+    const auto e=q[14]+(q[15]&0x1FF)*32;
+    if (rd(e,q[20]) && rd(e+8,q[21]) && rd(e+16,q[22]) && rd(e+24,q[23])) q[0]|=32;
+   }
+  }
+ }
+ if (rd(streamer+0x1C00,q[17]) && rd(streamer+0x1C38,q[18]) && rd(streamer+0xC0,q[19])) q[0]|=64;
+ __atomic_or_fetch(&tglRCSSoft[slot].valid,1ULL<<which,__ATOMIC_RELEASE);
+}
 
 struct TGLCSBIO {
  uint8_t *streamer, *owner;
@@ -16402,6 +16458,7 @@ void XE::wrapTGLCSBReset(void *streamer) {
   tglCSBInitialize(rcs);
   FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(rcs);
   ++tglResetCrossRCS;
+  if (tglResetSlot<TGLRecoveryPost::Recoveries) tglRCSSoftSample(tglResetSlot,1);
  }
  tglResetCSAfter(scope);
 }
