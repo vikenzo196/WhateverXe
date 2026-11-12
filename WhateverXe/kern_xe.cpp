@@ -412,6 +412,10 @@ uint32_t tglResetSlot=UINT32_MAX;
 // reset sharing the render domain (mask bit 1) also replayed the RCS tail.
 uint32_t tglResetGdrst {};
 uint32_t tglResetCrossRCS {};
+// Fork diagnostic (WEXRecoveryBCS): blitter state and ring dwords at its head,
+// sampled before (which=0) and after (which=1) each traced recovery. Defined
+// after tglVM/tglHostBase.
+void tglResetBCSSample(uint32_t slot,unsigned which);
 volatile uint8_t *tglResetMMIO {};
 void *tglResetAccel {};
 inline bool tglKernelPointer(const void *p) {return p && (reinterpret_cast<uintptr_t>(p)>>47)==0x1FFFF;}
@@ -465,6 +469,7 @@ void XE::wrapTGLRecovery(void *channel) {
 			tglResetGdrst=TGLRecovery::field<uint32_t>(ring,0x70);
 			tglResetWake(true);
 			if (trace) tglResetSample(trace->pre);
+			if (trace) tglResetBCSSample(n,0);
 			TGLResetFix::refresh(tglResetCache,tglResetMMIO);
 			tglResetWake(false);
 			if (trace) {trace->cacheValid=tglResetCache.valid;__atomic_or_fetch(&trace->valid,1ULL,__ATOMIC_RELEASE);}
@@ -476,6 +481,7 @@ void XE::wrapTGLRecovery(void *channel) {
 		tglResetWake(true);
 		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAfterReset;
 		if (trace) {tglResetSample(trace->afterReset);__atomic_or_fetch(&trace->valid,8ULL,__ATOMIC_RELEASE);}
+		if (trace) tglResetBCSSample(static_cast<uint32_t>(trace->recovery-1),1);
 		tglResetWake(false);
 	});
 	__atomic_store_n(&tglResetActive,0U,__ATOMIC_RELEASE);
@@ -2652,6 +2658,43 @@ volatile uint8_t *tglHostBase() {
   *reinterpret_cast<volatile uint8_t **>(static_cast<uint8_t *>(tglHost.owner)+0x1240) : nullptr;
 }
 void tglHostClock(uint64_t *q) { uint64_t t; clock_get_uptime(&t); absolutetime_to_nanoseconds(t,q); }
+// Fork diagnostic, see the declaration. Read-only: MMIO register reads under
+// the recovery's forcewake, GGTT PTE read from BAR0+8MiB, ring bytes through
+// the qualified direct map with nofault. No writes, maps or GPU work.
+// Per recovery and sample: q[0]=flags (1 regs, 2 PTE present, 4 copied),
+// q[1]=ring GGTT address read, q[2]=PTE, q[3]=physical; r[10] BCS registers;
+// d[16] ring dwords starting 32 bytes before the head.
+struct TGLResetBCSRecord {
+ uint64_t q[2][4];
+ uint32_t r[2][10];
+ uint32_t d[2][16];
+};
+TGLResetBCSRecord tglResetBCS[8] {};
+bool tglResetBCSSerialize(void *,void *,OSSerialize *serializer) {
+ auto out=OSData::withBytes(tglResetBCS,sizeof(tglResetBCS));if (!out) return false;
+ const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglResetBCSSample(uint32_t slot,unsigned which) {
+ if (slot>=arrsize(tglResetBCS) || which>1) return;
+ auto b=tglHostBase();if (!b) return;
+ auto &rec=tglResetBCS[slot];auto q=rec.q[which];auto r=rec.r[which];
+ static constexpr uint32_t regs[10] {0x22030,0x22034,0x22038,0x2203c,0x22068,0x22074,0x22234,0x22238,0x22140,0x22510};
+ for (unsigned i=0;i<10;++i) r[i]=*reinterpret_cast<volatile uint32_t *>(b+regs[i]);
+ q[0]=1;
+ const uint32_t head=r[1]&0x1FFFFC,start=r[2]&0xFFFFF000U;
+ if (!start || head<32) return;
+ const uint64_t gpu=uint64_t(start)+head-32;
+ if (((gpu+63)>>12)!=(gpu>>12)) return; // stay within one page
+ q[1]=gpu;
+ q[2]=*reinterpret_cast<volatile uint64_t *>(b+0x800000+((gpu&~4095ULL)>>9));
+ const uint64_t physical=q[2]&0x7FFFFFF000ULL;
+ if (!(q[2]&1) || !physical) return;
+ q[0]|=2;q[3]=physical+(gpu&4095);
+ if (!tglVM.nofault || !tglVM.directBase || q[3]>UINT64_MAX-tglVM.directBase) return;
+ const auto cpu=tglVM.directBase+q[3];
+ if (cpu<tglVM.directBase || cpu>=tglVM.directEnd || sizeof(rec.d[0])>tglVM.directEnd-cpu) return;
+ if (tglVM.nofault(cpu,reinterpret_cast<uintptr_t>(rec.d[which]),sizeof(rec.d[0]))==sizeof(rec.d[0])) q[0]|=4;
+}
 void tglHostRegisters(uint64_t *q) {
  auto b=tglHostBase(); if (!b) return;
  for (uint32_t i=0;i<arrsize(tglHostRegs);++i) q[i]=*reinterpret_cast<volatile uint32_t *>(b+tglHostRegs[i]);
@@ -13333,6 +13376,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 						}
 						if (auto c=OSSerializer::forTarget(nullptr,tglResetCacheSerialize)) {
 							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryCache",c);c->release();
+						}
+						if (auto c=OSSerializer::forTarget(nullptr,tglResetBCSSerialize)) {
+							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryBCS",c);c->release();
 						}
 					}
 				}
