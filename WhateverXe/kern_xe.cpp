@@ -408,6 +408,10 @@ const void *tglRCSResetList {};
 bool tglResetFixEnabled {};
 volatile uint32_t tglResetActive {};
 uint32_t tglResetSlot=UINT32_MAX;
+// GDRST mask of the ring in the active recovery, and how many times a non-RCS
+// reset sharing the render domain (mask bit 1) also replayed the RCS tail.
+uint32_t tglResetGdrst {};
+uint32_t tglResetCrossRCS {};
 volatile uint8_t *tglResetMMIO {};
 void *tglResetAccel {};
 inline bool tglKernelPointer(const void *p) {return p && (reinterpret_cast<uintptr_t>(p)>>47)==0x1FFFF;}
@@ -458,6 +462,7 @@ void XE::wrapTGLRecovery(void *channel) {
 				auto state=engine<8 ? TGLRecovery::field<uint8_t *>(ring,0x8B8+engine*8) : nullptr;
 				trace->engineFlags=(uint64_t(engine)<<32)|(tglKernelPointer(state) ? TGLRecovery::field<uint32_t>(state,0xA4) : 0xFFFFFFFFU);
 			}
+			tglResetGdrst=TGLRecovery::field<uint32_t>(ring,0x70);
 			tglResetWake(true);
 			if (trace) tglResetSample(trace->pre);
 			TGLResetFix::refresh(tglResetCache,tglResetMMIO);
@@ -474,7 +479,7 @@ void XE::wrapTGLRecovery(void *channel) {
 		tglResetWake(false);
 	});
 	__atomic_store_n(&tglResetActive,0U,__ATOMIC_RELEASE);
-	tglResetSlot=UINT32_MAX;
+	tglResetSlot=UINT32_MAX;tglResetGdrst=0;
 	uint64_t after {};clock_get_uptime(&after);
 	const auto post=__atomic_fetch_add(&tglRecoveryPostCount,1,__ATOMIC_RELAXED);
 	if (post<TGLRecoveryPost::Recoveries) {
@@ -16339,6 +16344,19 @@ void XE::wrapTGLCSBReset(void *streamer) {
  const auto scope=tglResetViaCSB ? tglResetCSBefore() : TGLResetCSScope{};
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ // Fork: a non-RCS ring reset with the render GDRST bit (compute 0x1a000, mask 2)
+ // also clears the RCS, but the donor only runs this tail for the ring it reset.
+ // Gen12 RCS/CCS share the reset domain (Linux resets both). The RCS registers
+ // were already replayed above; run the RCS tail too: CSB12 init + native
+ // processGPUReset (ring reset, stamp resubmit, execlist submit). No GDRST.
+ auto rcs=tglCSBEngines[0].streamer;
+ // tglCSBInitialize above stored this streamer in its own slot, so rcs!=streamer
+ // means this reset was for another engine.
+ if (scope.active && tglResetFixEnabled && (tglResetGdrst&2) && rcs && rcs!=streamer) {
+  tglCSBInitialize(rcs);
+  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(rcs);
+  ++tglResetCrossRCS;
+ }
  tglResetCSAfter(scope);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
@@ -16447,8 +16465,8 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    if (n<0) return;
    used=static_cast<size_t>(n)>=sizeof(reason)-used ? sizeof(reason) : used+n;
   };
-  add(" RST act=%u slot=%d cache=%u/%u/%u/%u csbInit=",__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE),
-   static_cast<int>(tglResetSlot),tglResetCache.count,tglResetCache.valid,tglResetCache.refreshes,tglResetCache.replays);
+  add(" RST act=%u slot=%d xrcs=%u cache=%u/%u/%u/%u csbInit=",__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE),
+   static_cast<int>(tglResetSlot),tglResetCrossRCS,tglResetCache.count,tglResetCache.valid,tglResetCache.refreshes,tglResetCache.replays);
   for (unsigned i=0;i<arrsize(tglCSBEngines);++i) add("%llu,",tglCSBEngines[i].resets);
   unsigned shown=0;
   for (unsigned r=TGLRecoveryPost::Recoveries;r && shown<4;--r) {
