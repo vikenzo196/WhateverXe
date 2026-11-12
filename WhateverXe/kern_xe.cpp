@@ -88,6 +88,7 @@
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
 #include "kern_tgl_recovery_post.hpp"
+#include "kern_tgl_reset_fix.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -386,10 +387,94 @@ void tglRecoveryPostWork(thread_call_param_t,thread_call_param_t) {
 }
 }
 
+// Fork: reset trace + RCS register replay (WEXRecoveryTrace / WEXResetFix).
+// Records, per recovery, which ring was reset (RESET_CTL/ring offsets, GDRST
+// mask, reset-register list, engine flags) and the RCS state before the reset,
+// at IGHardwareCommandStreamer5::processGPUReset (after the native restore
+// loop), after it, and after the whole reset. If HWS_PGA reads 0 at either
+// point the donor RCS list is replayed with remembered values.
+// Disable the replay with -wex-reset-nofix (trace stays).
+namespace {
+struct TGLResetTraceRecord {
+	uint64_t valid, recovery, ring, ringKind, gdrstMask, list, listCount, engineFlags;
+	uint64_t csCalls, fixAtCS, fixAfterReset, cacheValid;
+	uint32_t pre[TGLRecoveryPost::RegisterCount], atCS[TGLRecoveryPost::RegisterCount];
+	uint32_t afterCS[TGLRecoveryPost::RegisterCount], afterReset[TGLRecoveryPost::RegisterCount];
+};
+static_assert(sizeof(TGLResetTraceRecord)%8==0,"WEXRecoveryTrace layout");
+TGLResetTraceRecord tglResetTrace[TGLRecoveryPost::Recoveries] {};
+TGLResetFix::Cache tglResetCache {};
+const void *tglRCSResetList {};
+bool tglResetFixEnabled {};
+volatile uint32_t tglResetActive {};
+uint32_t tglResetSlot=UINT32_MAX;
+volatile uint8_t *tglResetMMIO {};
+void *tglResetAccel {};
+inline bool tglKernelPointer(const void *p) {return p && (reinterpret_cast<uintptr_t>(p)>>47)==0x1FFFF;}
+bool tglResetTraceSerialize(void *,void *,OSSerialize *serializer) {
+	auto out=OSData::withBytes(tglResetTrace,sizeof(tglResetTrace));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+bool tglResetCacheSerialize(void *,void *,OSSerialize *serializer) {
+	auto out=OSData::withBytes(&tglResetCache,sizeof(tglResetCache));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglResetWake(bool on) {
+	if (!tglRecoverySafeForceWake || !tglResetAccel) return;
+	using Wake=void (*)(void *,bool,unsigned);
+	reinterpret_cast<Wake>(tglRecoverySafeForceWake)(tglResetAccel,on,7);
+}
+void tglResetSample(uint32_t *out) {
+	for (unsigned i=0;i<TGLRecoveryPost::RegisterCount;++i)
+		out[i]=*reinterpret_cast<volatile uint32_t *>(tglResetMMIO+TGLRecoveryPost::Registers[i]);
+}
+}
+
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
-	const auto result=TGLRecovery::resetAndResume(channel);
+	// Fork: reset trace and RCS replay (see WEXRecoveryTrace above).
+	TGLResetTraceRecord *trace {};
+	{
+		auto ring=TGLRecovery::field<uint8_t *>(channel,0x130);
+		void *accel=tglKernelPointer(ring) ? TGLRecovery::field<void *>(ring,0x10) : nullptr;
+		auto mmio=tglKernelPointer(ring) ? TGLRecovery::field<uint8_t *>(ring,0x50) : nullptr;
+		if (tglKernelPointer(accel) && tglKernelPointer(mmio) && tglRecoverySafeForceWake) {
+			tglResetAccel=accel;tglResetMMIO=mmio;
+			if (n<TGLRecoveryPost::Recoveries) {trace=&tglResetTrace[n];tglResetSlot=n;}
+			auto list=TGLRecovery::field<const uint8_t *>(ring,0x78);
+			const auto kind=TGLRecovery::field<uint64_t>(ring,0x58);
+			if (!tglResetCache.count) {
+				if (tglKernelPointer(tglRCSResetList)) TGLResetFix::loadLayout(tglResetCache,tglRCSResetList);
+				if (!tglResetCache.count && static_cast<uint32_t>(kind)==0x203C && tglKernelPointer(list))
+					TGLResetFix::loadLayout(tglResetCache,list);
+			}
+			if (trace) {
+				trace->recovery=n+1;trace->ring=reinterpret_cast<uintptr_t>(ring);trace->ringKind=kind;
+				trace->gdrstMask=TGLRecovery::field<uint32_t>(ring,0x70);
+				trace->list=reinterpret_cast<uintptr_t>(list);
+				trace->listCount=tglKernelPointer(list) ? *reinterpret_cast<const uint64_t *>(list) : ~0ULL;
+				const auto engine=TGLRecovery::field<uint8_t>(ring,0x40);
+				auto state=engine<8 ? TGLRecovery::field<uint8_t *>(ring,0x8B8+engine*8) : nullptr;
+				trace->engineFlags=(uint64_t(engine)<<32)|(tglKernelPointer(state) ? TGLRecovery::field<uint32_t>(state,0xA4) : 0xFFFFFFFFU);
+			}
+			tglResetWake(true);
+			if (trace) tglResetSample(trace->pre);
+			TGLResetFix::refresh(tglResetCache,tglResetMMIO);
+			tglResetWake(false);
+			if (trace) {trace->cacheValid=tglResetCache.valid;__atomic_or_fetch(&trace->valid,1ULL,__ATOMIC_RELEASE);}
+			__atomic_store_n(&tglResetActive,1U,__ATOMIC_RELEASE);
+		}
+	}
+	const auto result=TGLRecovery::resetAndResume(channel,[trace](void *) {
+		if (!__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE)) return;
+		tglResetWake(true);
+		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAfterReset;
+		if (trace) {tglResetSample(trace->afterReset);__atomic_or_fetch(&trace->valid,8ULL,__ATOMIC_RELEASE);}
+		tglResetWake(false);
+	});
+	__atomic_store_n(&tglResetActive,0U,__ATOMIC_RELEASE);
+	tglResetSlot=UINT32_MAX;
 	uint64_t after {};clock_get_uptime(&after);
 	const auto post=__atomic_fetch_add(&tglRecoveryPostCount,1,__ATOMIC_RELAXED);
 	if (post<TGLRecoveryPost::Recoveries) {
@@ -410,6 +495,27 @@ void XE::wrapTGLRecovery(void *channel) {
 		__atomic_store_n(&q[15],1,__ATOMIC_RELEASE);
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
+}
+
+void XE::wrapTGLCSReset(void *streamer) {
+	// Native IGHardwareCommandStreamer5::processGPUReset: called by
+	// resetGraphicsEngine after GDRST and the native restore loop, under the
+	// donor's own forcewake. Only acts inside a traced recovery.
+	const bool active=__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE) && tglResetMMIO;
+	const auto slot=tglResetSlot;
+	auto trace=active && slot<TGLRecoveryPost::Recoveries ? &tglResetTrace[slot] : nullptr;
+	if (active) {
+		tglResetWake(true);
+		if (trace) {++trace->csCalls;tglResetSample(trace->atCS);__atomic_or_fetch(&trace->valid,2ULL,__ATOMIC_RELEASE);}
+		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAtCS;
+		tglResetWake(false);
+	}
+	FunctionCast(wrapTGLCSReset,callbackXE->orgTGLCSReset)(streamer);
+	if (active && trace) {
+		tglResetWake(true);
+		tglResetSample(trace->afterCS);__atomic_or_fetch(&trace->valid,4ULL,__ATOMIC_RELEASE);
+		tglResetWake(false);
+	}
 }
 
 extern "C" {
@@ -13179,6 +13285,34 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				}
 				patcher.clearError();
 				IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryPostReady",tglRecoverySafeForceWake && tglRecoveryPostCall);
+				// Fork: reset trace + RCS replay. Same qualified donor.
+				bool resetFixOK=false;
+				if (recoveryOK && tglRecoverySafeForceWake) {
+					const char *cs="__ZN26IGHardwareCommandStreamer515processGPUResetEv";
+					const uint8_t csHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,
+						0xB8,0x07,0,0,0,0x89,0x87,0x04,0x1C,0,0};
+					if (patcher.solveSymbol<mach_vm_address_t>(index,"_rcsResetRegisters",address,size)==address+0x14B2B0)
+						tglRCSResetList=reinterpret_cast<const void *>(address+0x14B2B0);
+					patcher.clearError();
+					if (patcher.solveSymbol<mach_vm_address_t>(index,cs,address,size)==address+0x3A396 &&
+						!memcmp(reinterpret_cast<void *>(address+0x3A396),csHead,sizeof(csHead))) {
+						KernelPatcher::RouteRequest hook[] {{cs,wrapTGLCSReset,orgTGLCSReset}};
+						resetFixOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
+					}
+					patcher.clearError();
+					tglResetFixEnabled=resetFixOK && !checkKernelArgument("-wex-reset-nofix");
+					if (resetFixOK) {
+						if (auto t=OSSerializer::forTarget(nullptr,tglResetTraceSerialize)) {
+							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryTrace",t);t->release();
+						}
+						if (auto c=OSSerializer::forTarget(nullptr,tglResetCacheSerialize)) {
+							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryCache",c);c->release();
+						}
+					}
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryTraceReady",resetFixOK);
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryFixEnabled",tglResetFixEnabled);
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryRCSList",tglRCSResetList!=nullptr);
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);

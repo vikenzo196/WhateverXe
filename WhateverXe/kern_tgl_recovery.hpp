@@ -19,7 +19,9 @@ struct Result {
 // failure, resume scheduling, return to IOAccel's error/event processing.
 // TGL's lower reset still owns hardware reset, context replay and CSB handling.
 // Do not append a new stamp or wait inside this recovery work-loop callback.
-inline Result resetAndResume(void *channel) {
+// afterReset runs between the native reset and the scheduler resume.
+template<typename AfterReset>
+inline Result resetAndResume(void *channel,AfterReset afterReset) {
 	void *ring=field<void *>(channel,0x130);
 	void *context=field<void *>(ring,0x20);
 	void *affected=field<void *>(context,0xB8); // ICL uses B0, NOT compatible.
@@ -30,12 +32,16 @@ inline Result resetAndResume(void *channel) {
 	result.resetOK=field<Reset>(field<void *>(ring,0),0x168)(ring,context);
 	if (!result.resetOK) ++field<uint32_t>(affected,0x17C);
 	result.failuresAfter=field<uint32_t>(affected,0x17C);
+	afterReset(ring);
 	// Reload after reset, as the native ICL caller does.
 	void *owner=field<void *>(channel,0x18);
 	void *scheduler=field<void *>(owner,0x1250); // ICL uses1280.
 	using Resume=void (*)(void *);
 	field<Resume>(field<void *>(scheduler,0),0x180)(scheduler);
 	return result;
+}
+inline Result resetAndResume(void *channel) {
+	return resetAndResume(channel,[](void *){});
 }
 }
 #endif

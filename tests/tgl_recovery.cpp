@@ -16,8 +16,9 @@ bool reset(void *r,void *c) {
 	if (replaceScheduler) TGLRecovery::field<void *>(owner,0x1250)=otherScheduler;
 	return nativeOK;
 }
+bool hooked;unsigned hooks;
 void resume(void *s) {
-	assert(s==(replaceScheduler ? otherScheduler : scheduler) && stage++==1);++resumes;
+	assert(s==(replaceScheduler ? otherScheduler : scheduler) && stage++==(hooked ? 2U : 1U));++resumes;
 }
 }
 int main() {
@@ -35,14 +36,19 @@ int main() {
 		TGLRecovery::field<decltype(&resume)>(schedulerVT,0x180)=resume;
 		TGLRecovery::field<uint32_t>(affected,0x20)=2;
 		TGLRecovery::field<uint32_t>(affected,0x17C)=initial;
-		nativeOK=ok;replaceScheduler=replace;resets=resumes=stage=0;
-		const auto result=TGLRecovery::resetAndResume(channel);
+		nativeOK=ok;replaceScheduler=replace;resets=resumes=stage=hooks=0;hooked=false;
+		auto result=TGLRecovery::resetAndResume(channel);
 		assert(resets==1 && resumes==1 && stage==2 && result.resetOK==ok);
+		// Hooked variant: callback sees the ring after reset, before resume.
+		TGLRecovery::field<void *>(owner,0x1250)=scheduler;TGLRecovery::field<uint32_t>(affected,0x17C)=initial;
+		resets=resumes=stage=0;hooked=true;
+		result=TGLRecovery::resetAndResume(channel,[](void *r){assert(r==ring && stage++==1);++hooks;});
+		assert(resets==1 && resumes==1 && hooks==1 && stage==3 && result.resetOK==ok);
 		assert(result.affected==reinterpret_cast<uintptr_t>(affected) && result.index==2);
 		assert(result.failuresBefore==initial && result.failuresAfter==initial+unsigned(!ok));
 		assert(TGLRecovery::field<uint32_t>(affected,0x178)==0xABCDEF);
 		// Affected channel comes from the context; do not update caller blindly.
 		assert(TGLRecovery::field<uint32_t>(channel,0x17C)==0);
 	}
-	puts("12 recovery cases passed: native result, count, order, affected channel, owner reload");
+	puts("24 recovery cases passed: native result, count, order, after-reset hook, affected channel, owner reload");
 }
