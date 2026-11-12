@@ -497,10 +497,12 @@ void XE::wrapTGLRecovery(void *channel) {
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
 }
 
-void XE::wrapTGLCSReset(void *streamer) {
-	// Native IGHardwareCommandStreamer5::processGPUReset: called by
-	// resetGraphicsEngine after GDRST and the native restore loop, under the
-	// donor's own forcewake. Only acts inside a traced recovery.
+namespace {
+// Shared by both entry points into IGHardwareCommandStreamer5::processGPUReset:
+// our own route (wrapTGLCSReset) or, when CSB12 already owns that method,
+// wrapTGLCSBReset. Only acts inside a traced recovery.
+struct TGLResetCSScope {bool active; TGLResetTraceRecord *trace;};
+TGLResetCSScope tglResetCSBefore() {
 	const bool active=__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE) && tglResetMMIO;
 	const auto slot=tglResetSlot;
 	auto trace=active && slot<TGLRecoveryPost::Recoveries ? &tglResetTrace[slot] : nullptr;
@@ -510,12 +512,26 @@ void XE::wrapTGLCSReset(void *streamer) {
 		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAtCS;
 		tglResetWake(false);
 	}
-	FunctionCast(wrapTGLCSReset,callbackXE->orgTGLCSReset)(streamer);
-	if (active && trace) {
+	return {active,trace};
+}
+void tglResetCSAfter(const TGLResetCSScope &scope) {
+	if (scope.active && scope.trace) {
 		tglResetWake(true);
-		tglResetSample(trace->afterCS);__atomic_or_fetch(&trace->valid,4ULL,__ATOMIC_RELEASE);
+		tglResetSample(scope.trace->afterCS);__atomic_or_fetch(&scope.trace->valid,4ULL,__ATOMIC_RELEASE);
 		tglResetWake(false);
 	}
+}
+// True when CSB12 routed processGPUReset first: the trace runs from its wrapper.
+bool tglResetViaCSB {};
+}
+
+void XE::wrapTGLCSReset(void *streamer) {
+	// Native IGHardwareCommandStreamer5::processGPUReset: called by
+	// resetGraphicsEngine after GDRST and the native restore loop, under the
+	// donor's own forcewake.
+	const auto scope=tglResetCSBefore();
+	FunctionCast(wrapTGLCSReset,callbackXE->orgTGLCSReset)(streamer);
+	tglResetCSAfter(scope);
 }
 
 extern "C" {
@@ -13294,10 +13310,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					if (patcher.solveSymbol<mach_vm_address_t>(index,"_rcsResetRegisters",address,size)==address+0x14B2B0)
 						tglRCSResetList=reinterpret_cast<const void *>(address+0x14B2B0);
 					patcher.clearError();
-					if (patcher.solveSymbol<mach_vm_address_t>(index,cs,address,size)==address+0x3A396 &&
-						!memcmp(reinterpret_cast<void *>(address+0x3A396),csHead,sizeof(csHead))) {
-						KernelPatcher::RouteRequest hook[] {{cs,wrapTGLCSReset,orgTGLCSReset}};
-						resetFixOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
+					if (patcher.solveSymbol<mach_vm_address_t>(index,cs,address,size)==address+0x3A396) {
+						if (orgTGLCSBReset) {
+							// CSB12 already routed this method (and changed its head reset
+							// operand), so csHead cannot match: trace from wrapTGLCSBReset.
+							resetFixOK=tglResetViaCSB=true;
+						} else if (!memcmp(reinterpret_cast<void *>(address+0x3A396),csHead,sizeof(csHead))) {
+							KernelPatcher::RouteRequest hook[] {{cs,wrapTGLCSReset,orgTGLCSReset}};
+							resetFixOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
+						}
 					}
 					patcher.clearError();
 					tglResetFixEnabled=resetFixOK && !checkKernelArgument("-wex-reset-nofix");
@@ -16314,8 +16335,11 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
 void XE::wrapTGLCSBReset(void *streamer) {
+ // RCS replay (HWS_PGA, GFX_MODE, ...) must precede CSB12 init, which samples GFX_MODE.
+ const auto scope=tglResetViaCSB ? tglResetCSBefore() : TGLResetCSScope{};
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ tglResetCSAfter(scope);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
