@@ -417,6 +417,8 @@ uint32_t tglResetSlot=UINT32_MAX;
 // reset sharing the render domain (mask bit 1) also replayed the RCS tail.
 uint32_t tglResetGdrst {};
 uint32_t tglResetCrossRCS {};
+// Native-tail notifications issued after resume (see wrapTGLRecovery).
+uint32_t tglResetNotify {};
 // Fork diagnostic (WEXRecoveryBCS): blitter state and ring dwords at its head,
 // sampled before (which=0) and after (which=1) each traced recovery. Defined
 // after tglVM/tglHostBase.
@@ -491,6 +493,23 @@ void XE::wrapTGLRecovery(void *channel) {
 		if (trace) tglRCSSoftSample(static_cast<uint32_t>(trace->recovery-1),2);
 		tglResetWake(false);
 	});
+	// Fork: the TGL donor's resetHardwareAndReplay, after the scheduler resume,
+	// calls owner+0x380 vtable+0x1d8 with the affected channel's stamp index
+	// (affected+0x20) on both engine paths, then submits a stamp and waits. The
+	// r123 single-pass caller drops the stamp/wait on purpose (queue overflow);
+	// it also dropped this notification. Issue only the notification, exactly
+	// as the donor does, never the extra stamp or the wait.
+	if (tglResetFixEnabled && tglKernelPointer(reinterpret_cast<void *>(result.affected))) {
+		auto owner=TGLRecovery::field<uint8_t *>(channel,0x18);
+		auto object=tglKernelPointer(owner) ? TGLRecovery::field<uint8_t *>(owner,0x380) : nullptr;
+		auto vtable=tglKernelPointer(object) ? TGLRecovery::field<uint8_t *>(object,0) : nullptr;
+		using Notify=void (*)(void *,uint32_t);
+		auto notify=tglKernelPointer(vtable) ? TGLRecovery::field<Notify>(vtable,0x1D8) : nullptr;
+		if (tglKernelPointer(reinterpret_cast<void *>(notify))) {
+			notify(object,TGLRecovery::field<uint32_t>(reinterpret_cast<void *>(result.affected),0x20));
+			++tglResetNotify;
+		}
+	}
 	__atomic_store_n(&tglResetActive,0U,__ATOMIC_RELEASE);
 	tglResetSlot=UINT32_MAX;tglResetGdrst=0;
 	uint64_t after {};clock_get_uptime(&after);
@@ -16568,8 +16587,8 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    if (n<0) return;
    used=static_cast<size_t>(n)>=sizeof(reason)-used ? sizeof(reason) : used+n;
   };
-  add(" RST act=%u slot=%d xrcs=%u cache=%u/%u/%u/%u csbInit=",__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE),
-   static_cast<int>(tglResetSlot),tglResetCrossRCS,tglResetCache.count,tglResetCache.valid,tglResetCache.refreshes,tglResetCache.replays);
+  add(" RST act=%u slot=%d xrcs=%u ntf=%u cache=%u/%u/%u/%u csbInit=",__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE),
+   static_cast<int>(tglResetSlot),tglResetCrossRCS,tglResetNotify,tglResetCache.count,tglResetCache.valid,tglResetCache.refreshes,tglResetCache.replays);
   for (unsigned i=0;i<arrsize(tglCSBEngines);++i) add("%llu,",tglCSBEngines[i].resets);
   unsigned shown=0;
   for (unsigned r=TGLRecoveryPost::Recoveries;r && shown<4;--r) {
