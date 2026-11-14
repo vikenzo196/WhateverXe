@@ -45,7 +45,6 @@ bool xelpSelectedDevice(IOPCIDevice *p){return p && selected;}
 bool xelpDisplay13RenderDevice(IOPCIDevice *p){return p && selected;}
 bool checkKernelArgument(const char*){return false;}
 template<class...T>void tglObserveAccelerator(T...){}
-template<class...T>void tglHideGVAScaler(T...){}
 const char *version="Darwin Kernel Version 25.6.73: arbitrary-metadata/RELEASE_X86_64";
 int kextIntelTGL,kextIntelTGLFb;
 bool adlnNativeRCSProfileRequested=false,display13TraceEnabled=false,display13Offline=false;
