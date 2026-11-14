@@ -423,10 +423,16 @@ uint32_t tglResetNotify {};
 // NOOPed, [3] last index, [4] last skip index, [5] last ring length, [6] status
 // of the last attempt (0 ok, 1 bad ring, 2 bad length).
 uint64_t tglResetSkip[8] {1};
+// Diagnostic copy of the last skipped ring: [0] non-zero dwords, [1] dwords with
+// opcode 0x31 (any flags), [2] offset of the first non-zero dword, [3..66] 64
+// dwords from there (before the NOOP pass), [67] ring CPU address low bits.
+uint32_t tglResetSkipDump[68] {};
 uint32_t tglResetLastIndex=UINT32_MAX;
 uint64_t tglResetLastTime {};
 bool tglResetSkipSerialize(void *,void *,OSSerialize *serializer) {
-	auto out=OSData::withBytes(tglResetSkip,sizeof(tglResetSkip));if (!out) return false;
+	uint8_t both[sizeof(tglResetSkip)+sizeof(tglResetSkipDump)];
+	memcpy(both,tglResetSkip,sizeof(tglResetSkip));memcpy(both+sizeof(tglResetSkip),tglResetSkipDump,sizeof(tglResetSkipDump));
+	auto out=OSData::withBytes(both,sizeof(both));if (!out) return false;
 	const bool ok=out->serialize(serializer);out->release();return ok;
 }
 bool tglVMRead(uint64_t address,uint64_t &value); // defined with tglVM
@@ -472,8 +478,20 @@ void tglResetSkipGuilty(void *channel,uint32_t index) {
 	if (length<4096 || length>32768 || (length&(length-1))) {tglResetSkip[6]=2;return;}
 	auto dw=reinterpret_cast<volatile uint32_t *>(cpu);
 	uint64_t noops=0;
+	{
+		uint32_t nonzero=0,opcode=0,first=UINT32_MAX;
+		for (uint32_t i=0;i<length/4;++i) {
+			const auto d=dw[i];
+			if (d) {++nonzero;if (first==UINT32_MAX) first=i;}
+			if ((d>>23)==0x31) ++opcode;
+		}
+		tglResetSkipDump[0]=nonzero;tglResetSkipDump[1]=opcode;tglResetSkipDump[2]=first==UINT32_MAX?0:first*4;
+		for (uint32_t j=0;j<64;++j) tglResetSkipDump[3+j]=first!=UINT32_MAX && first+j<length/4 ? dw[first+j] : 0;
+		tglResetSkipDump[67]=static_cast<uint32_t>(cpu);
+	}
 	for (uint32_t i=0;i+2<length/4;++i) {
-		if ((dw[i]&0xFFFFFE00U)==0x18800000U && (dw[i]&0xFF)==1) {
+		// MI_BATCH_BUFFER_START, 3 dwords, any address-space/second-level flags.
+		if ((dw[i]>>23)==0x31 && (dw[i]&0xFF)==1) {
 			dw[i]=0;dw[i+1]=0;dw[i+2]=0;noops+=3;i+=2;
 		}
 	}
