@@ -15940,6 +15940,16 @@ void XE::tglObserveAccelerator(IOService *that, uint32_t stage, bool done, uint6
 		IOLog("AlderLakeN native stage=%u done=%u result=%llx detail=%llx\n",stage,done,result,detail);
 }
 
+// WhateverXe Graphics 0.4.4 rejects VPHAL video-processing contexts (func 0x800) to avoid the RCS
+// colour-conversion hang. WindowServer still advertises the GVA scaler from IOGVAScaler and asserts in
+// AVFPixelProcessCore when the context is refused (AirPlay receiver, scaled video layers). Without the
+// property WindowServer scales with Metal instead. -wex-keep-gvascaler keeps the donor behaviour.
+static void tglHideGVAScaler(IOService *accelerator) {
+	if (!accelerator || checkKernelArgument("-wex-keep-gvascaler") || !accelerator->getProperty("IOGVAScaler")) return;
+	accelerator->removeProperty("IOGVAScaler");
+	accelerator->setProperty("WEXGVAScalerRemoved", true);
+}
+
 IOService *XE::wrapTGLAcceleratorProbe(IOService *that, IOService *provider, SInt32 *score) {
  if((callbackXE->tglGT2Detected && !callbackXE->tglGT2Ready) ||
     (callbackXE->display12SmallGTDetected && !callbackXE->display12SmallGTReady) ||
@@ -15972,6 +15982,7 @@ IOService *XE::wrapTGLAcceleratorProbe(IOService *that, IOService *provider, SIn
 	}
 	auto result = FunctionCast(wrapTGLAcceleratorProbe, callbackXE->orgTGLAcceleratorProbe)(that, provider, score);
 	tglObserveAccelerator(that, 1, true, reinterpret_cast<uintptr_t>(result), identity);
+	if (result) tglHideGVAScaler(result);
 	return result;
 }
 
