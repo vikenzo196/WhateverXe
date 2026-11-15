@@ -460,6 +460,32 @@ void tglResetWake(bool on) {
 	using Wake=void (*)(void *,bool,unsigned);
 	reinterpret_cast<Wake>(tglRecoverySafeForceWake)(tglResetAccel,on,7);
 }
+// Fork: RCU_MODE (0x14800) bit 0 enables the compute streamer. The donor sets it
+// only in IntelAccelerator::initModeRegisters (startGraphicsEngine); no reset
+// list restores it. A render-domain GDRST (mask 2, e.g. the compute ring's own
+// reset) can clear it, and the CCS then ignores every new submission: the
+// ELSQ is loaded but no CSB event ever follows. Re-enable it when it was set
+// before the reset and reads clear after it.
+// WEXRecoveryRCU: q[0] schema, [1] value before the last reset, [2] at
+// processGPUReset, [3] after the whole reset, [4] re-enables, [5] checks,
+// [6] last value read back after a re-enable.
+constexpr uint32_t tglRCUMode=0x14800;
+uint64_t tglResetRCU[8] {1};
+bool tglResetRCUSerialize(void *,void *,OSSerialize *serializer) {
+	auto out=OSData::withBytes(tglResetRCU,sizeof(tglResetRCU));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+// Call with forcewake held. slot: 2 at processGPUReset, 3 after the reset.
+void tglResetRCUCheck(unsigned slot) {
+	if (!tglResetMMIO) return;
+	auto reg=reinterpret_cast<volatile uint32_t *>(tglResetMMIO+tglRCUMode);
+	const uint32_t now=*reg;
+	tglResetRCU[slot]=now;++tglResetRCU[5];
+	if (tglResetFixEnabled && (tglResetRCU[1]&1) && !(now&1)) {
+		*reg=0x00010001U; // masked write: enable bit 0 only
+		tglResetRCU[6]=*reg;++tglResetRCU[4];
+	}
+}
 void tglResetSample(uint32_t *out) {
 	for (unsigned i=0;i<TGLRecoveryPost::RegisterCount;++i)
 		out[i]=*reinterpret_cast<volatile uint32_t *>(tglResetMMIO+TGLRecoveryPost::Registers[i]);
@@ -534,6 +560,7 @@ void XE::wrapTGLRecovery(void *channel) {
 			}
 			tglResetGdrst=TGLRecovery::field<uint32_t>(ring,0x70);
 			tglResetWake(true);
+			tglResetRCU[1]=*reinterpret_cast<volatile uint32_t *>(tglResetMMIO+tglRCUMode);
 			if (trace) tglResetSample(trace->pre);
 			if (trace) tglResetBCSSample(n,0);
 			tglRCSSoftSample(n,0);
@@ -559,6 +586,7 @@ void XE::wrapTGLRecovery(void *channel) {
 		if (!__atomic_load_n(&tglResetActive,__ATOMIC_ACQUIRE)) return;
 		tglResetWake(true);
 		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAfterReset;
+		tglResetRCUCheck(3);
 		if (trace) {tglResetSample(trace->afterReset);__atomic_or_fetch(&trace->valid,8ULL,__ATOMIC_RELEASE);}
 		if (trace) tglResetBCSSample(static_cast<uint32_t>(trace->recovery-1),1);
 		if (trace) tglRCSSoftSample(static_cast<uint32_t>(trace->recovery-1),2);
@@ -618,6 +646,7 @@ TGLResetCSScope tglResetCSBefore() {
 		tglResetWake(true);
 		if (trace) {++trace->csCalls;tglResetSample(trace->atCS);__atomic_or_fetch(&trace->valid,2ULL,__ATOMIC_RELEASE);}
 		if (tglResetFixEnabled && TGLResetFix::replay(tglResetCache,tglResetMMIO) && trace) ++trace->fixAtCS;
+		tglResetRCUCheck(2);
 		tglResetWake(false);
 	}
 	return {active,trace};
@@ -13488,6 +13517,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 						}
 						if (auto c=OSSerializer::forTarget(nullptr,tglResetSkipSerialize)) {
 							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoverySkip",c);c->release();
+						}
+						if (auto c=OSSerializer::forTarget(nullptr,tglResetRCUSerialize)) {
+							IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryRCU",c);c->release();
 						}
 					}
 				}
