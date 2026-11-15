@@ -347,6 +347,8 @@ TGLRecoveryPost::Record tglRecoveryPost[TGLRecoveryPost::Recoveries] {};
 uint32_t tglRecoveryPostCount {};
 mach_vm_address_t tglRecoverySafeForceWake {};
 thread_call_t tglRecoveryPostCall {};
+// Fork diagnostic (WEXRecoveryStall / WEXRecoveryClock), defined after tglCSBEngines.
+void tglStallStart();
 volatile uint32_t tglRecoveryPostSlot=UINT32_MAX, tglRecoveryPostNext=0;
 const uint32_t tglRecoveryPostDelaysMs[TGLRecoveryPost::Samples] {0,20,200,1000,3000};
 bool tglRecoveryPostSerialize(void *,void *,OSSerialize *serializer) {
@@ -13443,6 +13445,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				if (recoveryOK && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size)==address+0x28C2A) {
 					tglRecoverySafeForceWake=address+0x28C2A;
 					if (!tglRecoveryPostCall) tglRecoveryPostCall=thread_call_allocate(tglRecoveryPostWork,nullptr);
+					tglStallStart();
 					if (auto post=OSSerializer::forTarget(nullptr,tglRecoveryPostSerialize)) {
 						IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryPost",post);post->release();
 					}
@@ -16308,6 +16311,9 @@ struct TGLCSBEngine {
  bool hardwareReady {false};
  uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {};
  uint32_t modeAtInit {UINT32_MAX};
+ // Fork diagnostic: time of the last consumed CSB event, and the engine's CSB pointer register.
+ uint64_t lastConsumeAbs {};
+ uint32_t pointerReg {};
 // Exact donor kIGHwCsDesc has six 0x79-byte records, IDs0..5. The scheduler's
 // `index > 4` exit is AFTER construction, so it also constructs ID5.
 } tglCSBEngines[6];
@@ -16356,6 +16362,123 @@ void tglRCSSoftSample(uint32_t slot,unsigned which) {
  }
  if (rd(streamer+0x1C00,q[17]) && rd(streamer+0x1C38,q[18]) && rd(streamer+0xC0,q[19])) q[0]|=64;
  __atomic_or_fetch(&tglRCSSoft[slot].valid,1ULL<<which,__ATOMIC_RELEASE);
+}
+
+// Fork diagnostic (WEXRecoveryStall): catch the "hardware idle, scheduler still waiting" stall at its
+// start instead of 5-7 s later in the GPU restart path. A 2 Hz thread call compares each engine's
+// consumed-CSB counter; when a streamer has been busy (flag +0x1C3C clear) for more than 1.5 s without
+// a single CSB event, one record is taken: software state of the four engines, their registers under
+// the donor's SafeForceWake, the HWSP copy of the CSB and the GT interrupt enables. Read-only: no
+// register writes, no scheduler calls, no locks; memory through tglVMRead (nofault). At most 6 records;
+// an engine re-arms after its counter moves again.
+// Record: q[0]=schema 1, q[1]=uptime ns, q[2]=trigger engine, q[3]=stalled ns, q[4]=sequence, q[5]=flags
+// (1 soft, 2 mmio). soft[e]: streamer, consumed, last consume (uptime ns), lastRaw, head|resets<<32,
+// +0x50, +0x30, +0x38, +0x40, +0x48, +0x1C00, +0x1C38, +0xC0, hwsp, owner, pointerReg.
+// reg[e]: engine base + tglStallRegs. csb[e]: 12 HWSP entries (+0x40) and the qword at +0xB8 (write
+// pointer in its high dword). irq: tglStallIrqRegs.
+const uint32_t tglStallRegs[24] {0x30,0x34,0x38,0x3C,0x68,0x6C,0x70,0x74,0x9C,0xA8,0xB0,0xB8,
+ 0x234,0x238,0x29C,0x3A0,0x510,0x514,0x518,0x51C,0x550,0x140,0x98,0x50};
+const uint32_t tglStallIrqRegs[8] {0x190010,0x190018,0x19001C,0x190030,0x190034,0x190090,0x1900A0,0x1900A8};
+struct TGLStallRecord {
+ uint64_t q[8];
+ uint64_t soft[4][16];
+ uint32_t reg[4][24];
+ uint64_t csb[4][13];
+ uint32_t irq[8];
+};
+static_assert(sizeof(TGLStallRecord)%8==0,"WEXRecoveryStall layout");
+TGLStallRecord tglStall[6] {};
+uint32_t tglStallCount {};
+struct {uint64_t consumed, changeNs; bool armed;} tglStallTrack[4] {};
+thread_call_t tglStallCall {};
+uint64_t tglStallNowNs() {uint64_t t,n;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&n);return n;}
+bool tglStallSerialize(void *,void *,OSSerialize *serializer) {
+ auto out=OSData::withBytes(tglStall,sizeof(tglStall));if (!out) return false;
+ const bool ok=out->serialize(serializer);out->release();return ok;
+}
+// Live view for the sentinel's first snapshot: q[0]=schema 1, q[1]=uptime ns now, q[2]=records taken,
+// then per engine: consumed, last consume (uptime ns), busy (1 = streamer waiting for a CSB), resets.
+bool tglStallClockSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t q[3+4*4] {1,tglStallNowNs(),__atomic_load_n(&tglStallCount,__ATOMIC_RELAXED)};
+ for (unsigned e=0;e<4;++e) {
+  const auto &E=tglCSBEngines[e];auto v=q+3+e*4;uint64_t n=0,f=0;
+  absolutetime_to_nanoseconds(E.lastConsumeAbs,&n);
+  v[0]=E.consumed;v[1]=n;v[3]=E.resets;
+  const auto streamer=reinterpret_cast<uint64_t>(E.streamer);
+  v[2]=((streamer>>47)==0x1FFFF && tglVMRead(streamer+0x1C38,f)) ? ((f>>32)==0) : 2;
+ }
+ auto out=OSData::withBytes(q,sizeof(q));if (!out) return false;
+ const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglStallCapture(unsigned trigger,uint64_t stalledNs,uint64_t nowNs) {
+ const auto slot=__atomic_load_n(&tglStallCount,__ATOMIC_RELAXED);
+ if (slot>=arrsize(tglStall)) return;
+ auto &r=tglStall[slot];memset(&r,0,sizeof(r));
+ r.q[1]=nowNs;r.q[2]=trigger;r.q[3]=stalledNs;r.q[4]=slot+1;
+ uint64_t owner=0,bar=0;
+ for (unsigned e=0;e<4;++e) {
+  const auto &E=tglCSBEngines[e];auto q=r.soft[e];
+  const auto streamer=reinterpret_cast<uint64_t>(E.streamer);
+  if ((streamer>>47)!=0x1FFFF) continue;
+  uint64_t n=0;absolutetime_to_nanoseconds(E.lastConsumeAbs,&n);
+  q[0]=streamer;q[1]=E.consumed;q[2]=n;q[3]=E.lastRaw;q[4]=E.state.head|(E.resets<<32);q[15]=E.pointerReg;
+  tglVMRead(streamer+0x50,q[5]);
+  for (unsigned i=0;i<4;++i) tglVMRead(streamer+0x30+i*8,q[6+i]);
+  tglVMRead(streamer+0x1C00,q[10]);tglVMRead(streamer+0x1C38,q[11]);tglVMRead(streamer+0xC0,q[12]);
+  tglVMRead(streamer+0x68,q[13]);tglVMRead(streamer+0x10,q[14]);
+  if ((q[13]>>47)==0x1FFFF && !(q[13]&63)) {
+   for (unsigned i=0;i<12;++i) tglVMRead(q[13]+0x40+i*8,r.csb[e][i]);
+   tglVMRead(q[13]+0xB8,r.csb[e][12]);
+  }
+  if (!owner && (q[14]>>47)==0x1FFFF) owner=q[14];
+ }
+ r.q[5]|=1;
+ if (owner && tglVMRead(owner+0x1240,bar) && (bar>>47)==0x1FFFF && tglRecoverySafeForceWake && tglHost.barSize>=0x1000000) {
+  using Wake=void (*)(void *,bool,unsigned);
+  auto wake=reinterpret_cast<Wake>(tglRecoverySafeForceWake);
+  auto mmio=reinterpret_cast<volatile uint8_t *>(bar);
+  wake(reinterpret_cast<void *>(owner),true,7);
+  for (unsigned e=0;e<4;++e) {
+   const auto reg=tglCSBEngines[e].pointerReg;
+   if (reg<0x3A0 || reg>tglHost.barSize-0x1000) continue;
+   const auto base=reg-0x3A0;
+   for (unsigned i=0;i<arrsize(tglStallRegs);++i)
+    r.reg[e][i]=*reinterpret_cast<volatile uint32_t *>(mmio+base+tglStallRegs[i]);
+  }
+  for (unsigned i=0;i<arrsize(tglStallIrqRegs);++i)
+   r.irq[i]=*reinterpret_cast<volatile uint32_t *>(mmio+tglStallIrqRegs[i]);
+  wake(reinterpret_cast<void *>(owner),false,7);
+  r.q[5]|=2;
+ }
+ __atomic_store_n(&r.q[0],1ULL,__ATOMIC_RELEASE);
+ __atomic_store_n(&tglStallCount,slot+1,__ATOMIC_RELEASE);
+}
+void tglStallWork(thread_call_param_t,thread_call_param_t) {
+ const auto now=tglStallNowNs();
+ int trigger=-1;uint64_t stalled=0;
+ for (unsigned e=0;e<4;++e) {
+  const auto &E=tglCSBEngines[e];auto &T=tglStallTrack[e];
+  const auto streamer=reinterpret_cast<uint64_t>(E.streamer);
+  uint64_t f=0;
+  const bool busy=E.hardwareReady && (streamer>>47)==0x1FFFF && tglVMRead(streamer+0x1C38,f) && (f>>32)==0;
+  if (!busy || E.consumed!=T.consumed || !T.changeNs) {T.consumed=E.consumed;T.changeNs=now;T.armed=true;continue;}
+  if (T.armed && now-T.changeNs>1500000000ULL) {T.armed=false;if (trigger<0) {trigger=static_cast<int>(e);stalled=now-T.changeNs;}}
+ }
+ if (trigger>=0) tglStallCapture(static_cast<unsigned>(trigger),stalled,now);
+ if (tglStallCall) {
+  uint64_t deadline {};clock_interval_to_deadline(500,kMillisecondScale,&deadline);
+  thread_call_enter_delayed(tglStallCall,deadline);
+ }
+}
+void tglStallStart() {
+ if (tglStallCall || checkKernelArgument("-wex-stall-off")) return;
+ tglStallCall=thread_call_allocate(tglStallWork,nullptr);
+ if (!tglStallCall) return;
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (auto c=OSSerializer::forTarget(nullptr,tglStallSerialize)) {root->setProperty("WEXRecoveryStall",c);c->release();}
+ if (auto c=OSSerializer::forTarget(nullptr,tglStallClockSerialize)) {root->setProperty("WEXRecoveryClock",c);c->release();}
+ uint64_t deadline {};clock_interval_to_deadline(30000,kMillisecondScale,&deadline);
+ thread_call_enter_delayed(tglStallCall,deadline);
 }
 
 struct TGLCSBIO {
@@ -16410,7 +16533,7 @@ void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  // Called before the first submission, wake reset, or GPU-reset replay. Never
  // at reset's return: that method can submit GPU work before it returns.
- engine.streamer=streamer;TGLCSB::initialize(engine.state,io);
+ engine.streamer=streamer;engine.pointerReg=io.pointerReg;TGLCSB::initialize(engine.state,io);
  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
@@ -16618,7 +16741,7 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    memcpy(record->q+47,banks+4,32);
    __atomic_store_n(&record->q[51],1,__ATOMIC_RELEASE);
   }
-  ++engine.consumed;return true;
+  ++engine.consumed;engine.lastConsumeAbs=mach_absolute_time();return true;
  };
  const auto initialHead=engine.state.head;
  const auto error=TGLCSB::drain(engine.state,io,consume);

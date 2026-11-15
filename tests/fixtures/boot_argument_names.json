@@ -161,5 +161,6 @@
   "-wex-edp-auxbl-final": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
-  "-wex-reset-nofix": []
+  "-wex-reset-nofix": [],
+  "-wex-stall-off": []
 }
