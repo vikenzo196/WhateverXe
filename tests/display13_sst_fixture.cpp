@@ -192,7 +192,8 @@ int main(int argc,char **argv){
  for(unsigned ddi=0;ddi<2;++ddi) {
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);
   assert(XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));
-  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&XE::display13PanelBootPort(f.port)==f.port);++panelBootCases;
+  // 0.8.3 (f49ff77): display13SSTPort itself admits unset Combo mode 0.
+  put(f.port,0x550,0U);assert(XE::display13SSTPort(f.port)&&XE::display13PanelBootPort(f.port)==f.port);++panelBootCases;
   for(unsigned mode:{2U,3U,4U}){put(f.port,0x550,mode);assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
   put(f.port,0x550,0U);assert(XE::display13PanelBootPort(f.port));
   auto &c=display13FBPower;
@@ -208,15 +209,16 @@ int main(int argc,char **argv){
   for(uint32_t id:{0xA7218086U,0xA7A18086U,0xA7A98086U,0xA7AC8086U,0xA7AD8086U}){state.xeProfile.identity=id;assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
   for(uint32_t id:{0xA7208086U,0xA7A08086U,0xA7A88086U,0xA7AA8086U,0xA7AB8086U,0x46A68086U,0x46D08086U}){state.xeProfile.identity=id;assert(XE::display13PanelBootPort(f.port));++panelBootCases;}
   state.xeProfile.identity=0;
-  // No other SST caller is loosened: with mode 0 they still refuse, once the native mode is set they run as before.
+  // 0.8.3 (f49ff77) admits unset Combo mode 0 in every SST caller; the fork's
+  // boot-port admission is now only a fallback with the same result.
   assert(XE::display13PanelBootPort(f.port));
-  assert(XE::wrapDisplay13EnablePort(f.port)==kIOReturnNotReady&&!linkCalls);
   put(f.port,0x550,1U);assert(!XE::display13PanelBootPort(f.port)&&XE::display13SSTPort(f.port));
   assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
  }
  for(unsigned ddi=0;ddi<2;++ddi) {
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20);
-  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
+  // Non-panel Combo DP: 0.8.3 SST admits mode 0, the fork boot port stays panel-only.
+  put(f.port,0x550,0U);assert(XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
   assert(objectRefs.empty());
  }
  {

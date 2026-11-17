@@ -145,13 +145,8 @@ int main(int argc,char **argv){
   auto q=parse(b.data(),b.size(),Family::TigerLake);
   assert(q.panel.valid&&q.panel.lowSwing&&q.panel.hobl&&q.panel.type==n);
  }
- {
-  // 0xFF (select by EDID PnP ID) falls back to panel type 0, as i915 does
-  // without an OpRegion or PnP match.
-  auto b=panelTable;b[options]=255;
-  auto q=parse(b.data(),b.size(),Family::TigerLake);
-  assert(q.valid()&&q.hdmi(3).hdmi==2&&q.panel.valid&&q.panel.type==0&&q.panel.ddi==0);
- }
+ // 0xFF (select by EDID PnP ID): 0.8.3 resolves the firmware identity, see
+ // tests/firmware_panel_identity.cpp; the fork's profile-0 fallback is gone.
  for(unsigned bad=0;bad<5;++bad) {
   auto b=panelTable;
   if(bad==0)b[options]=254;

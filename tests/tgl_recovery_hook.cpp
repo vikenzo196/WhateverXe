@@ -5,10 +5,14 @@
 #include <initializer_list>
 
 namespace {
+// Fork afterReset hook on a non-Blit ring (ring+0x40 = 0, render).
 alignas(16) uint8_t channel[0x180],affected[0x180],ring[0x100],context[0xD0];
 alignas(16) uint8_t owner[0x1300],scheduler[0x200],otherScheduler[0x200];
 alignas(16) uint8_t ringVT[0x200],schedulerVT[0x200];
 unsigned resets,resumes,stage;bool nativeOK,replaceScheduler;
+void submit(void *) {assert(!"no stamp outside a successful Blit reset");}
+bool wait(void *,uint32_t *,uint32_t,uint32_t) {assert(!"no wait outside a successful Blit reset");return true;}
+const TGLRecovery::StampOps stampOps {submit,wait};
 bool reset(void *r,void *c) {
 	assert(r==ring && c==context && stage++==0);++resets;
 	// Native side effects must survive. No caller-synthesized completion.
@@ -37,12 +41,12 @@ int main() {
 		TGLRecovery::field<uint32_t>(affected,0x20)=2;
 		TGLRecovery::field<uint32_t>(affected,0x17C)=initial;
 		nativeOK=ok;replaceScheduler=replace;resets=resumes=stage=hooks=0;hooked=false;
-		auto result=TGLRecovery::resetAndResume(channel);
+		auto result=TGLRecovery::resetAndResume(channel,stampOps);
 		assert(resets==1 && resumes==1 && stage==2 && result.resetOK==ok);
 		// Hooked variant: callback sees the ring after reset, before resume.
 		TGLRecovery::field<void *>(owner,0x1250)=scheduler;TGLRecovery::field<uint32_t>(affected,0x17C)=initial;
 		resets=resumes=stage=0;hooked=true;
-		result=TGLRecovery::resetAndResume(channel,[](void *r){assert(r==ring && stage++==1);++hooks;});
+		result=TGLRecovery::resetAndResume(channel,stampOps,[](void *r){assert(r==ring && stage++==1);++hooks;});
 		assert(resets==1 && resumes==1 && hooks==1 && stage==3 && result.resetOK==ok);
 		assert(result.affected==reinterpret_cast<uintptr_t>(affected) && result.index==2);
 		assert(result.failuresBefore==initial && result.failuresAfter==initial+unsigned(!ok));
@@ -50,5 +54,5 @@ int main() {
 		// Affected channel comes from the context; do not update caller blindly.
 		assert(TGLRecovery::field<uint32_t>(channel,0x17C)==0);
 	}
-	puts("24 recovery cases passed: native result, count, order, after-reset hook, affected channel, owner reload");
+	puts("24 recovery cases passed: native result, count, order, after-reset hook, affected channel, owner reload (non-Blit)");
 }

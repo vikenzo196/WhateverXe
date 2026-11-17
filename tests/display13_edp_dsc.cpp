@@ -569,14 +569,14 @@ int main() {
     printf("eDP DSC source admitted; linear plan status %u (1 = Ready), pipe %u\n",unsigned(status),plan.pipe);
     assert(status==LinearStatus::Ready && plan.pipe==0);
     admitDSCPanel=false;
-    // Panel selection from the VBT: rejected by default (AUX backlight),
-    // admitted with -wex-edp-dsc, and the boot transcoder then selects DDI A.
+    // Panel selection from the VBT: since 0.8.3 the AUX-backlight panel is
+    // admitted without -wex-edp-dsc too (allowAux), and the boot transcoder
+    // then selects DDI A. -wex-edp-dsc is still needed for the DSC source.
     const auto ports=XELP::VBT::parse(vbt,sizeof(vbt),XELP::Family::RaptorLakeP);
     assert(ports.valid() && ports.panel.valid && ports.panel.ddi==0 && ports.panel.type==9 && ports.panel.backlightType==5);
     XELP::panelAUXBacklight=false;
     auto plain=XELP::VBT::display13Fixed(ports,Display13OutputWiring::Physical,XELP::Family::RaptorLakeP);
-    assert(!plain.panel);
-    assert(Display13FBTopology::bootDDI(plain,io.regs[0x60400],true)==UINT32_MAX);
+    assert(plain.panel==1 && Display13FBTopology::bootDDI(plain,io.regs[0x60400],true)==0);
     XELP::panelAUXBacklight=true;
     auto board=XELP::VBT::display13Fixed(ports,Display13OutputWiring::Physical,XELP::Family::RaptorLakeP);
     printf("VBT wiring: valid %d described %d panel %x dp %x hdmi %x\n",board.valid,board.described(),board.panel,board.dp,board.hdmi);
