@@ -27,6 +27,7 @@ def compile_fixture(directory, fixture):
                    '#include "kern_graphics_activation.hpp"\n'
                    'static unsigned hostStarts=0;\n'
                    'struct {void init(){++hostStarts;}} host;\n'
+                   'namespace XeWSYuv {static unsigned starts=0; void init(){++starts;}}\n'
                    'void activateFixturePlugin(){('+activation+')();}\n'+fixture)
     subprocess.run(['clang++', '-std=c++17', '-O1', '-g',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer',

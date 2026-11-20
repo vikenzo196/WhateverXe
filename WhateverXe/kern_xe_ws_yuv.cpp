@@ -31,12 +31,20 @@ static const uint8_t kSupportedDetachFind[] {
     0xF2, 0x0F, 0x10, 0x4D, 0xE0
 };
 
+// Known file offsets of the signature inside the main shared cache file. Pages
+// that contain the bytes anywhere else are left untouched and only recorded.
+//   25G342 (macOS 26.7.3): dyld_shared_cache_x86_64h + 0x9545EA3 (SkyLight __TEXT)
+static const uint64_t kSupportedDetachOffsets[] {0x9545EA3};
+static const char kSharedCacheMain[] = "/dyld_shared_cache_x86_64h";
+
 using GetPathFn = int (*)(void *vnode, char *pathbuf, int *len);
 
 GetPathFn getPath = nullptr;
 mach_vm_address_t orgCsValidatePage = 0;
 mach_vm_address_t orgCsValidateRange = 0;
 volatile SInt32 hitCount = 0;
+volatile SInt32 missCount = 0;
+volatile uint64_t lastMissOffset = 0;
 
 inline uint8_t *findPattern(const void *data, size_t size) {
     if (!data || size < sizeof(kSupportedDetachFind)) return nullptr;
@@ -52,12 +60,25 @@ inline uint8_t *findPattern(const void *data, size_t size) {
     return nullptr;
 }
 
-__attribute__((noinline)) void applyIfSharedCache(void *vp, uint8_t *match) {
+__attribute__((noinline)) void applyIfSharedCache(void *vp, uint8_t *match, uint64_t fileOffset) {
     if (!vp || !match || !getPath) return;
     char path[MAXPATHLEN];
     int length = static_cast<int>(sizeof(path));
     if (getPath(vp, path, &length) != 0) return;
     if (!UserPatcher::matchSharedCachePath(path)) return;
+    const size_t pathLength = strnlen(path, sizeof(path));
+    const size_t suffixLength = sizeof(kSharedCacheMain) - 1;
+    bool known = pathLength >= suffixLength && !strcmp(path + pathLength - suffixLength, kSharedCacheMain);
+    if (known) {
+        known = false;
+        for (auto offset : kSupportedDetachOffsets) known |= offset == fileOffset;
+    }
+    if (!known) {
+        lastMissOffset = fileOffset;
+        if (OSIncrementAtomic(&missCount) < 4)
+            SYSLOG("wex", "SkyLight YUV detach signature at unknown offset 0x%llx, left unpatched", fileOffset);
+        return;
+    }
     if (match[2] != 0x74) return;
     match[2] = 0xEB;
     const SInt32 prev = OSIncrementAtomic(&hitCount);
@@ -73,7 +94,7 @@ void patchedCsValidatePage(void *vp, void *pager, uint64_t pageOffset, const voi
         vp, pager, pageOffset, data, validatedP, taintedP, nxP);
     if (!vp || !data || !validatedP || *validatedP == 0 || (taintedP && *taintedP != 0)) return;
     if (uint8_t *match = findPattern(data, PAGE_SIZE)) {
-        applyIfSharedCache(vp, match);
+        applyIfSharedCache(vp, match, pageOffset + static_cast<uint64_t>(match - static_cast<const uint8_t *>(data)));
     }
 }
 
@@ -81,18 +102,19 @@ boolean_t patchedCsValidateRange(void *vp, void *pager, uint64_t rangeOffset, co
                                  vm_size_t size, unsigned *tainted) {
     const boolean_t res = FunctionCast(patchedCsValidateRange, orgCsValidateRange)(
         vp, pager, rangeOffset, data, size, tainted);
-    if (!res || !vp || !data || size < sizeof(kSupportedDetachFind) || size > (64U * PAGE_SIZE)) {
+    if (!res || (tainted && *tainted != 0) || !vp || !data || size < sizeof(kSupportedDetachFind) || size > (64U * PAGE_SIZE)) {
         return res;
     }
     if (uint8_t *match = findPattern(data, static_cast<size_t>(size))) {
-        applyIfSharedCache(vp, match);
+        applyIfSharedCache(vp, match, rangeOffset + static_cast<uint64_t>(match - static_cast<const uint8_t *>(data)));
     }
     return res;
 }
 
 bool serializeHits(void *, void *, OSSerialize *serializer) {
-    const uint32_t count = static_cast<uint32_t>(__atomic_load_n(&hitCount, __ATOMIC_RELAXED));
-    auto num = OSNumber::withNumber(count, 32);
+    const uint64_t count = static_cast<uint32_t>(__atomic_load_n(&hitCount, __ATOMIC_RELAXED)) |
+        (static_cast<uint64_t>(static_cast<uint32_t>(__atomic_load_n(&missCount, __ATOMIC_RELAXED))) << 32);
+    auto num = OSNumber::withNumber(count, 64);
     if (!num) return false;
     const bool ok = num->serialize(serializer);
     num->release();
@@ -118,6 +140,16 @@ void onPatcherLoad(void *, KernelPatcher &patcher) {
     if (auto hits = OSSerializer::forTarget(nullptr, serializeHits)) {
         root->setProperty("WhateverXeWSYUVDetachHits", hits);
         hits->release();
+    }
+    if (auto miss = OSSerializer::forTarget(nullptr, [](void *, void *, OSSerialize *serializer) {
+            auto num = OSNumber::withNumber(__atomic_load_n(&lastMissOffset, __ATOMIC_RELAXED), 64);
+            if (!num) return false;
+            const bool ok = num->serialize(serializer);
+            num->release();
+            return ok;
+        })) {
+        root->setProperty("WhateverXeWSYUVDetachMissOffset", miss);
+        miss->release();
     }
     SYSLOG("wex", "SkyLight YUV detach cs_validate hook installed=%d (page=%d range=%d)",
            installed ? 1 : 0, pageRouted ? 1 : 0, rangeRouted ? 1 : 0);

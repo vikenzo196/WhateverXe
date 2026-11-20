@@ -37,12 +37,12 @@ xelp_combo_clock_guard display13_tc_preparation display13_tc_disconnect display1
 display13_retirement display13_trial_retirement display13_port_wait display13_agdc
 display13_boot_handoff display13_clock_runtime display13_training_frontend framebuffer_donor_runtime compat_bundle_version dsi_backlight_adapter
 dsi_restart dsi_panel dsi_command_adapter dsi_irq_live dsi_surface_adapter dsi_aperture_adapter
-display13_shutdown display13_edp_keep_route display13_wake_notifications released_physical_admission released_topology
+display13_shutdown ws_yuv display13_edp_keep_route display13_wake_notifications released_physical_admission released_topology
 accelerator_resources display13_power_dispatch tgl_recovery test_runner_contract
 """.split()
 FAMILIES = {'BigSur':'bigsur', 'Monterey':'monterey', 'Ventura':'ventura',
             'Sonoma':'sonoma', 'Sequoia':'sequoia', 'Tahoe':'tahoe'}
-DONOR_TESTS = """tgl_aux_native tgl_boot_power tgl_disable_native display13_agdc display13_shutdown display13_edp_keep_route dsi_update_dispatch dsi_path_disposal
+DONOR_TESTS = """tgl_aux_native tgl_boot_power tgl_disable_native display13_agdc display13_shutdown ws_yuv display13_edp_keep_route dsi_update_dispatch dsi_path_disposal
 dsi_surface dsi_native_cache dsi_native_mode dsi_boot_probe dsi_port_adapter
 dsi_apple_adapter dsi_apple_timing_native adls_ddi_power_native display13_tc_preparation
 display13_retirement display13_port_wait framebuffer_training_registration
