@@ -10,6 +10,7 @@
 
 #include "kern_host.hpp"
 #include "kern_graphics_activation.hpp"
+#include "kern_xe_ws_yuv.hpp"
 
 static XeHost host;
 
@@ -40,6 +41,7 @@ PluginConfiguration ADDPR(config) {
 	[]() {
 		host.init();
 		WEXGraphicsActivation::publish();
+		XeWSYuv::init();
 	}
 };
 
