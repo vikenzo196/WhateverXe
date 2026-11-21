@@ -1,5 +1,6 @@
 // Copyright © 2018 vit9696. Derived from WhateverGreen (BSD-3-Clause).
 #include "kern_host.hpp"
+#include "kern_wex_plane_trace.hpp"
 #include "kern_donor.hpp"
 #include <mach/kmod.h>
 #include "kern_host_power_contract.hpp"
@@ -99,6 +100,7 @@ void XeHost::processKernel(KernelPatcher &patcher) {
   }
   gpu->setProperty("WhateverXePhysicalGGC",gpu->configRead16(0x50),32);
   xe.processKernel(patcher,info);
+  if(auto v=patcher.solveSymbol(KernelPatcher::KernelID,"_vinfo"))WEXPlaneTrace::setConsole(reinterpret_cast<void *>(v));else patcher.clearError();
   if(resetFramebuffer==FB_COPY || resetFramebuffer==FB_ZEROFILL) {
    auto v=reinterpret_cast<vc_info *>(patcher.solveSymbol(KernelPatcher::KernelID,"_vinfo"));
    if(v){consoleVinfo=*v;gotConsoleVinfo=true;}else patcher.clearError();

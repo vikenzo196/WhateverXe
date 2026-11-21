@@ -22,6 +22,7 @@
 #include "kern_mtl_posh_fix.hpp"
 #include <Headers/kern_crypto.hpp>
 #include "kern_alderlake_n.hpp"
+#include "kern_wex_plane_trace.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
@@ -9712,7 +9713,9 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	if(!featuresSelected)return false;
     if(Display13FBTopology::deferredBootPrepare(board,s->adlpDisplaySelected) && !s->prepareDisplay13BootScanout(pci))return false;
 	SYSLOG("igfx","Display13 native controller start enter offline=%u",display13Offline);
+	if(!checkKernelArgument("-wex-noplanetrace"))WEXPlaneTrace::start(pci);
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
+	WEXPlaneTrace::started();
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);

@@ -50,6 +50,7 @@ struct DeviceInfo {
  IOPCIDevice *videoBuiltin=nullptr,*managementEngine=nullptr;bool reportedFramebufferIsConnectorLess=false;
  static DeviceInfo value;static DeviceInfo *create(){return &value;}static void deleter(DeviceInfo *){events.push_back(9);}
 };DeviceInfo DeviceInfo::value;
+namespace WEXPlaneTrace {inline void setConsole(void *){}}
 namespace WIOKit {bool awaitPublishing(IOPCIDevice *){events.push_back(1);published=publish;return publish;}void renameDevice(IOPCIDevice *device,const char *name){device->name=name;++device->renames;events.push_back(5);}}
 // DEVICE_ADAPTER
 #define KMOD_MAX_NAME 64

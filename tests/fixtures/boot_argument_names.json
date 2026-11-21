@@ -156,6 +156,7 @@
   "-wex-pm": [],
   "-wex-ws-gva": [],
   "-wex-fbrefresh": [],
+  "-wex-noplanetrace": [],
   "-wex-flip-trace": [],
   "-wex-flip-dedupe": [],
   "-wex-edp-auxbl": [],
