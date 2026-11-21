@@ -13796,6 +13796,11 @@ bool XE::wrapFramebufferInit(IOService *fb,IOService *controller,uint32_t index)
  struct Objects {size_t size(void *p) const {return p ? static_cast<OSObject *>(p)->getMetaClass()->getClassSize() : 0;}} objects;
  const bool bound=FramebufferDonor::bindManagers(objects,fb,controller,index);
  fb->setProperty("WEXFramebufferManagersBound",bound);
+ // IOFramebuffer::postOpen -> initFB repaints the whole boot framebuffer through an
+ // uncached VRAM map (~9 s at 2880x1800). A false IOFBNeedsRefresh before the first
+ // open makes needsInit 2, so IOGraphics keeps the firmware image instead.
+ if(!checkKernelArgument("-wex-fbrefresh") && !fb->getProperty("IOFBNeedsRefresh"))
+  fb->setProperty("IOFBNeedsRefresh",false);
  if(callbackXE->display13FramebufferRequested)fb->setProperty("N97FBManagersBound",bound);
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("TGLWEGFramebufferManagerBound",bound);
