@@ -1,5 +1,5 @@
-// Read-only boot handoff trace for the primary plane (pipe A plane 1) and the
-// kernel console. Diagnoses the ~1 s garbled boot logo seen when the native
+// Boot handoff trace for the primary plane (pipe A plane 1), cursor, PSR and the
+// eDP link. Diagnoses the ~1 s garbled boot logo seen when the native
 // framebuffer takes over the firmware scanout. Samples MMIO every 5 ms for 25 s
 // from just before native framebuffer start, stores an entry only on change,
 // and publishes the entries as WEXPlaneTrace in the registry root.
@@ -30,14 +30,17 @@ struct Entry {
     uint32_t size;        // PLANE_SIZE_1_A 0x70190
     uint32_t surf;        // PLANE_SURF_1_A 0x7019C
     uint32_t live;        // PLANE_SURFLIVE_1_A 0x701AC
-    uint32_t offset;      // PLANE_OFFSET_1_A 0x701A4
-    uint32_t ctl2;        // PLANE_CTL_2_A 0x70280
-    uint32_t surf2;       // PLANE_SURF_2_A 0x7029C
-    uint32_t vrow, vwidth, vheight, vdepth;
-    uint64_t vbase;       // kernel console v_baseaddr
+    uint32_t psr;         // EDP_PSR_CTL transcoder A 0x60800
+    uint32_t psrStat;     // EDP_PSR_STATUS transcoder A 0x60840
+    uint32_t psr2;        // EDP_PSR2_CTL transcoder A 0x60900
+    uint32_t psr2Stat;    // EDP_PSR2_STATUS transcoder A 0x60940
+    uint32_t curCtl;      // CUR_CTL_A 0x70080
+    uint32_t curBase;     // CUR_BASE_A 0x70084
+    uint32_t ddiBuf;      // DDI_BUF_CTL_A 0x64000
+    uint64_t dpTp;        // DP_TP_CTL transcoder A 0x60540
 };
 
-inline constexpr unsigned MaxEntries=96;
+inline constexpr unsigned MaxEntries=200;
 inline Entry entries[MaxEntries];
 inline volatile uint32_t count;
 inline volatile uint32_t mark;
@@ -98,15 +101,15 @@ inline void work(thread_call_param_t,thread_call_param_t) {
         }
         e.ns=ns;e.mark=mark;
         e.ctl=rd(0x70180);e.stride=rd(0x70188);e.size=rd(0x70190);e.surf=rd(0x7019C);
-        e.live=rd(0x701AC);e.offset=rd(0x701A4);e.ctl2=rd(0x70280);e.surf2=rd(0x7029C);
-        if(console) {
-            e.vrow=console->v_rowbytes;e.vwidth=console->v_width;e.vheight=console->v_height;
-            e.vdepth=console->v_depth;e.vbase=console->v_baseaddr;
-        }
+        e.live=rd(0x701AC);e.psr=rd(0x60800);e.psrStat=rd(0x60840);e.psr2=rd(0x60900);
+        e.psr2Stat=rd(0x60940);e.curCtl=rd(0x70080);e.curBase=rd(0x70084);e.ddiBuf=rd(0x64000);
+        e.dpTp=rd(0x60540);
+        // PSR status registers also carry counters; compare only their state fields.
         const bool changed=first || e.mark!=last.mark || e.ctl!=last.ctl || e.stride!=last.stride ||
-            e.size!=last.size || e.surf!=last.surf || e.live!=last.live || e.offset!=last.offset ||
-            e.ctl2!=last.ctl2 || e.surf2!=last.surf2 || e.vrow!=last.vrow || e.vbase!=last.vbase ||
-            e.vwidth!=last.vwidth || e.vdepth!=last.vdepth;
+            e.size!=last.size || e.surf!=last.surf || e.live!=last.live || e.psr!=last.psr ||
+            (e.psrStat>>29)!=(last.psrStat>>29) || e.psr2!=last.psr2 ||
+            (e.psr2Stat>>28)!=(last.psr2Stat>>28) || e.curCtl!=last.curCtl || e.curBase!=last.curBase ||
+            e.ddiBuf!=last.ddiBuf || e.dpTp!=last.dpTp;
         if(changed) {
             const uint32_t n=__atomic_load_n(&count,__ATOMIC_RELAXED);
             entries[n]=e;__atomic_store_n(&count,n+1,__ATOMIC_RELEASE);
