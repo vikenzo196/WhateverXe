@@ -9713,7 +9713,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	if(!featuresSelected)return false;
     if(Display13FBTopology::deferredBootPrepare(board,s->adlpDisplaySelected) && !s->prepareDisplay13BootScanout(pci))return false;
 	SYSLOG("igfx","Display13 native controller start enter offline=%u",display13Offline);
-	if(!checkKernelArgument("-wex-noplanetrace"))WEXPlaneTrace::start(pci);
+	if(!checkKernelArgument("-wex-noplanetrace"))WEXPlaneTrace::start(pci,!checkKernelArgument("-wex-noplaneguard"));
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
 	WEXPlaneTrace::started();
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
