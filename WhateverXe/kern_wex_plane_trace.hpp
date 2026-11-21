@@ -46,7 +46,7 @@ inline thread_call_t call;
 inline ConsoleInfo *console;
 inline bool guardEnabled;
 // Guard record: state (0 idle, 1 suppressed, 2 released), suppress count, release reason
-// (1 new surface, 2 timeout), ns at first suppress, ns at release, boot surface, boot control.
+// (1 steady flips, 2 timeout), ns at first suppress, ns at release, surface changes seen, boot control.
 inline uint64_t guardRecord[7];
 
 inline void setConsole(void *vinfo) {console=static_cast<ConsoleInfo *>(vinfo);}
@@ -66,27 +66,33 @@ inline void work(thread_call_param_t,thread_call_param_t) {
     bool first=true;
     uint32_t bootSurf=rd(0x7019C),bootCtl=rd(0x70180);
     const bool bootLinear=((bootCtl>>10)&7)==0 && (bootCtl&0x80000000U);
-    guardRecord[5]=bootSurf;guardRecord[6]=bootCtl;
+    guardRecord[6]=bootCtl;
     uint32_t state=0;uint64_t suppressNs=0;
+    uint32_t lastSurf=bootSurf;uint64_t flips[4] {};unsigned nflips=0;
     for(unsigned i=0;i<5000 && __atomic_load_n(&count,__ATOMIC_RELAXED)<MaxEntries;++i) {
         Entry e {};
         uint64_t now=mach_absolute_time(),ns=0;absolutetime_to_nanoseconds(now,&ns);
         if(guardEnabled && bootLinear && state!=2) {
             // Native start switches plane 1A to Y-tiling before it points the plane at its
             // own surface; the firmware's linear image is then scanned out as tiles (the
-            // white bands). Keep the plane dark only for that interval.
+            // white bands). The first native surfaces are not drawn yet either (white lines
+            // with the cursor), so keep the plane dark until the boot progress animation
+            // flips steadily: 4 surface changes within 150 ms. Timeout 6 s.
             const uint32_t ctl=rd(0x70180),surf=rd(0x7019C);
             const bool tiled=((ctl>>10)&7)!=0;
-            if(surf!=bootSurf) {
-                if(state==1 && !(ctl&0x80000000U)) {wr(0x70180,ctl|0x80000000U);wr(0x7019C,surf);}
-                if(state==1) {state=2;guardRecord[2]=1;guardRecord[4]=ns;}
-            } else if(tiled && (ctl&0x80000000U) && guardRecord[1]<64) {
+            if(state==1 && surf!=lastSurf) {
+                lastSurf=surf;
+                flips[nflips%4]=ns;++nflips;
+                guardRecord[5]=nflips;
+            }
+            const bool steady=nflips>=4 && ns-flips[(nflips-4)%4]<150000000ULL;
+            if(state==1 && (steady || ns-suppressNs>6000000000ULL)) {
+                if(!(ctl&0x80000000U)) {wr(0x70180,ctl|0x80000000U);wr(0x7019C,surf);}
+                state=2;guardRecord[2]=steady?1:2;guardRecord[4]=ns;
+            } else if(tiled && (ctl&0x80000000U) && (state==1 || surf==bootSurf) && guardRecord[1]<512) {
                 wr(0x70180,ctl&~0x80000000U);wr(0x7019C,surf);
                 if(state==0)suppressNs=ns,guardRecord[3]=ns;
                 state=1;++guardRecord[1];
-            } else if(state==1 && ns-suppressNs>3000000000ULL) {
-                wr(0x70180,ctl|0x80000000U);wr(0x7019C,surf);
-                state=2;guardRecord[2]=2;guardRecord[4]=ns;
             }
             guardRecord[0]=state;
         }
