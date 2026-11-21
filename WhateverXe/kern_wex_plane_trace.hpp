@@ -49,8 +49,9 @@ inline thread_call_t call;
 inline ConsoleInfo *console;
 inline bool guardEnabled;
 // Guard record: state (0 idle, 1 suppressed, 2 released), suppress count, release reason
-// (1 steady flips, 2 timeout), ns at first suppress, ns at release, surface changes seen, boot control.
-inline uint64_t guardRecord[7];
+// (1 steady flips, 2 timeout), ns at first suppress, ns at release, surface changes seen, boot control,
+// longest gap between guard polls while active (ns) and when it ended (ns).
+inline uint64_t guardRecord[9];
 
 inline void setConsole(void *vinfo) {console=static_cast<ConsoleInfo *>(vinfo);}
 
@@ -72,10 +73,15 @@ inline void work(thread_call_param_t,thread_call_param_t) {
     guardRecord[6]=bootCtl;
     uint32_t state=0;uint64_t suppressNs=0;
     uint32_t lastSurf=bootSurf;uint64_t flips[4] {};unsigned nflips=0;
-    for(unsigned i=0;i<5000 && __atomic_load_n(&count,__ATOMIC_RELAXED)<MaxEntries;++i) {
+    uint64_t startNs=0,lastPoll=0,lastSample=0;absolutetime_to_nanoseconds(mach_absolute_time(),&startNs);
+    for(unsigned i=0;__atomic_load_n(&count,__ATOMIC_RELAXED)<MaxEntries;++i) {
         Entry e {};
         uint64_t now=mach_absolute_time(),ns=0;absolutetime_to_nanoseconds(now,&ns);
-        if(guardEnabled && bootLinear && state!=2) {
+        if(ns-startNs>25000000000ULL)break;
+        const bool guarding=guardEnabled && bootLinear && state!=2 && ns-startNs<15000000000ULL;
+        if(guarding && lastPoll && ns-lastPoll>guardRecord[7]) {guardRecord[7]=ns-lastPoll;guardRecord[8]=ns;}
+        lastPoll=ns;
+        if(guarding) {
             // Native start switches plane 1A to Y-tiling before it points the plane at its
             // own surface; the firmware's linear image is then scanned out as tiles (the
             // white bands). The first native surfaces are not drawn yet either (white lines
@@ -99,6 +105,8 @@ inline void work(thread_call_param_t,thread_call_param_t) {
             }
             guardRecord[0]=state;
         }
+        if(guarding && ns-lastSample<5000000ULL && i) {IOSleep(1);continue;}
+        lastSample=ns;
         e.ns=ns;e.mark=mark;
         e.ctl=rd(0x70180);e.stride=rd(0x70188);e.size=rd(0x70190);e.surf=rd(0x7019C);
         e.live=rd(0x701AC);e.psr=rd(0x60800);e.psrStat=rd(0x60840);e.psr2=rd(0x60900);
@@ -116,7 +124,7 @@ inline void work(thread_call_param_t,thread_call_param_t) {
             last=e;first=false;
         }
         if((i%200)==199)publish();
-        IOSleep(state==1?2:5);
+        IOSleep(guarding?1:5);
     }
     publish();
     IORegistryEntry::getRegistryRoot()->setProperty("WEXPlaneTraceDone",true);
@@ -128,7 +136,7 @@ inline void start(IOPCIDevice *pci,bool guard) {
     guardEnabled=guard;
     map=pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache);
     if(!map || map->getLength()<0x80000) {OSSafeReleaseNULL(map);return;}
-    call=thread_call_allocate(work,nullptr);
+    call=thread_call_allocate_with_priority(work,nullptr,THREAD_CALL_PRIORITY_HIGH);
     if(!call) {OSSafeReleaseNULL(map);return;}
     mark=1;
     IORegistryEntry::getRegistryRoot()->setProperty("WEXPlaneTraceEntrySize",static_cast<unsigned long long>(sizeof(Entry)),32);
