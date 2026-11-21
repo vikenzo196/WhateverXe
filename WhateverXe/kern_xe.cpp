@@ -9716,6 +9716,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	if(!checkKernelArgument("-wex-noplanetrace"))WEXPlaneTrace::start(pci,!checkKernelArgument("-wex-noplaneguard"));
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
 	WEXPlaneTrace::started();
+	if(!checkKernelArgument("-wex-noshutguard"))WEXPlaneTrace::armShutdown();
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);

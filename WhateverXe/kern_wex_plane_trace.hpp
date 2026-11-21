@@ -9,6 +9,9 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
+#include <IOKit/IODeviceTreeSupport.h>
 #include <Headers/kern_util.hpp>
 
 namespace WEXPlaneTrace {
@@ -145,5 +148,56 @@ inline void start(IOPCIDevice *pci,bool guard) {
 }
 
 inline void started() {mark=2;}
+
+// Shutdown/restart: the native teardown scans out stale content through the
+// Y-tiled plane for 2-3 s (bands). After the kernel announces power-off/restart
+// keep plane 1A dark until the machine goes down. Record what was seen in
+// NVRAM (wex-shutguard) since the registry does not survive the power cycle:
+// [message, ctl at notice, surf at notice, suppressions, ms to last suppression].
+inline thread_call_t shutCall;
+inline IONotifier *shutNotifier;
+inline uint32_t shutRecord[5];
+
+inline void shutSave() {
+    if(auto opts=IORegistryEntry::fromPath("/options",gIODTPlane)) {
+        if(auto d=OSData::withBytes(shutRecord,sizeof(shutRecord))) {opts->setProperty("wex-shutguard",d);d->release();}
+        opts->release();
+    }
+}
+
+inline void shutWork(thread_call_param_t,thread_call_param_t) {
+    auto base=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+    auto rd=[base](uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(base+reg);};
+    auto wr=[base](uint32_t reg,uint32_t v){*reinterpret_cast<volatile uint32_t *>(base+reg)=v;};
+    shutRecord[1]=rd(0x70180);shutRecord[2]=rd(0x7019C);
+    uint64_t start=mach_absolute_time(),startNs=0;absolutetime_to_nanoseconds(start,&startNs);
+    uint32_t saved=~0U;
+    for(unsigned i=0;i<60000;++i) {
+        const uint32_t ctl=rd(0x70180);
+        if(ctl&0x80000000U) {
+            wr(0x70180,ctl&~0x80000000U);wr(0x7019C,rd(0x7019C));
+            uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+            ++shutRecord[3];shutRecord[4]=static_cast<uint32_t>((ns-startNs)/1000000ULL);
+        }
+        if(shutRecord[3]!=saved && (i%50)==0) {saved=shutRecord[3];shutSave();}
+        IOSleep(1);
+    }
+}
+
+inline IOReturn shutHandler(void *,void *,UInt32 type,IOService *,void *,vm_size_t) {
+    if((type==kIOMessageSystemWillPowerOff || type==kIOMessageSystemWillRestart) && shutCall && map && !shutRecord[0]) {
+        shutRecord[0]=type==kIOMessageSystemWillPowerOff?1:2;
+        shutSave();
+        thread_call_enter(shutCall);
+    }
+    return kIOReturnSuccess;
+}
+
+// Call after native framebuffer start; opt out with -wex-noshutguard (checked by the caller).
+inline void armShutdown() {
+    if(shutNotifier || !map)return;
+    shutCall=thread_call_allocate_with_priority(shutWork,nullptr,THREAD_CALL_PRIORITY_HIGH);
+    if(shutCall)shutNotifier=registerPrioritySleepWakeInterest(shutHandler,nullptr,nullptr);
+}
 
 }

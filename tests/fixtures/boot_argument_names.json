@@ -158,6 +158,7 @@
   "-wex-fbrefresh": [],
   "-wex-noplanetrace": [],
   "-wex-noplaneguard": [],
+  "-wex-noshutguard": [],
   "-wex-flip-trace": [],
   "-wex-flip-dedupe": [],
   "-wex-edp-auxbl": [],
