@@ -11,6 +11,7 @@
 // -wex-noshutguard (surface 0 watch and power-off guard).
 #pragma once
 #include <IOKit/IOLib.h>
+#include <libkern/c++/OSSerialize.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
@@ -156,7 +157,29 @@ inline void start(IOPCIDevice *pci,bool guard) {
     IOSleep(15); // let the first sample record the firmware scanout before native start
 }
 
-inline void started() {mark=2;}
+
+// On-demand GT power sample (read-only, always-on/mirror range, no forcewake):
+// WEXGTPower = [ns, GEN12_RPSTAT1 0x1381B4 (CAGF [19:11] x 50/3 MHz), GEN6_GT_GFX_RC6
+// 0x138108 (1.28 us ticks), 0x145960, GT_PERF_STATUS 0x145948, RP_STATE_CAP 0x145998].
+// Each registry read of the property takes a fresh sample.
+inline bool gtPowerSerialize(void *,void *,OSSerialize *serializer) {
+    uint64_t q[6] {};
+    if(map && map->getLength()>=0x146000) {
+        auto base=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+        absolutetime_to_nanoseconds(mach_absolute_time(),q);
+        const uint32_t regs[] {0x1381B4,0x138108,0x145960,0x145948,0x145998};
+        for(unsigned i=0;i<5;++i)q[1+i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
+    }
+    auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+    const bool ok=data->serialize(serializer);data->release();return ok;
+}
+inline void publishGTPower() {
+    if(auto s=OSSerializer::forTarget(nullptr,gtPowerSerialize)) {
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXGTPower",s);s->release();
+    }
+}
+
+inline void started() {mark=2;publishGTPower();}
 
 // Shutdown/restart: the native teardown scans out stale content through the
 // Y-tiled plane for 2-3 s (bands). After the kernel announces power-off/restart
