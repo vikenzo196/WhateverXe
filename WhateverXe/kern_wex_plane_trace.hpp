@@ -51,6 +51,8 @@ inline IOMemoryMap *map;
 inline thread_call_t call;
 inline ConsoleInfo *console;
 inline bool guardEnabled;
+inline bool watchEnabled;
+inline void startWatch();
 // Guard record: state (0 idle, 1 suppressed, 2 released), suppress count, release reason
 // (1 steady flips, 2 timeout), ns at first suppress, ns at release, surface changes seen, boot control,
 // longest gap between guard polls while active (ns) and when it ended (ns).
@@ -75,7 +77,7 @@ inline void work(thread_call_param_t,thread_call_param_t) {
     const bool bootLinear=((bootCtl>>10)&7)==0 && (bootCtl&0x80000000U);
     guardRecord[6]=bootCtl;
     uint32_t state=0;uint64_t suppressNs=0;
-    uint32_t lastSurf=bootSurf;uint64_t flips[4] {};unsigned nflips=0;
+    uint32_t lastSurf=bootSurf;uint64_t flips[8] {};unsigned nflips=0;
     uint64_t startNs=0,lastPoll=0,lastSample=0;absolutetime_to_nanoseconds(mach_absolute_time(),&startNs);
     for(unsigned i=0;__atomic_load_n(&count,__ATOMIC_RELAXED)<MaxEntries;++i) {
         Entry e {};
@@ -89,15 +91,16 @@ inline void work(thread_call_param_t,thread_call_param_t) {
             // own surface; the firmware's linear image is then scanned out as tiles (the
             // white bands). The first native surfaces are not drawn yet either (white lines
             // with the cursor), so keep the plane dark until the boot progress animation
-            // flips steadily: 4 surface changes within 150 ms. Timeout 6 s.
+            // flips steadily: 8 surface changes within 250 ms (the first native surfaces
+            // change 3-4 times in a short burst before they are drawn). Timeout 6 s.
             const uint32_t ctl=rd(0x70180),surf=rd(0x7019C);
             const bool tiled=((ctl>>10)&7)!=0;
             if(state==1 && surf!=lastSurf) {
                 lastSurf=surf;
-                flips[nflips%4]=ns;++nflips;
+                flips[nflips%8]=ns;++nflips;
                 guardRecord[5]=nflips;
             }
-            const bool steady=nflips>=4 && ns-flips[(nflips-4)%4]<150000000ULL;
+            const bool steady=nflips>=8 && ns-flips[(nflips-8)%8]<250000000ULL;
             if(state==1 && (steady || ns-suppressNs>6000000000ULL)) {
                 if(!(ctl&0x80000000U)) {wr(0x70180,ctl|0x80000000U);wr(0x7019C,surf);}
                 state=2;guardRecord[2]=steady?1:2;guardRecord[4]=ns;
@@ -131,6 +134,7 @@ inline void work(thread_call_param_t,thread_call_param_t) {
     }
     publish();
     IORegistryEntry::getRegistryRoot()->setProperty("WEXPlaneTraceDone",true);
+    if(watchEnabled)startWatch();
 }
 
 // Call just before the native framebuffer controller start.
@@ -184,6 +188,41 @@ inline void shutWork(thread_call_param_t,thread_call_param_t) {
     }
 }
 
+// After boot, a light watcher (every 20 ms) keeps plane 1A dark whenever the
+// native driver scans out the firmware surface 0 with Y-tiling: this never
+// happens in normal use, only on the way down (before the power-off notice),
+// where it shows the stale linear image as bands. Record in NVRAM wex-surf0guard:
+// [suppressions, ctl seen, uptime s at first, uptime s at last].
+inline thread_call_t watchCall;
+inline uint32_t watchRecord[4];
+inline void watchSave() {
+    if(auto opts=IORegistryEntry::fromPath("/options",gIODTPlane)) {
+        if(auto d=OSData::withBytes(watchRecord,sizeof(watchRecord))) {opts->setProperty("wex-surf0guard",d);d->release();}
+        opts->release();
+    }
+}
+inline void watchWork(thread_call_param_t,thread_call_param_t) {
+    auto base=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+    const uint32_t ctl=*reinterpret_cast<volatile uint32_t *>(base+0x70180);
+    const uint32_t surf=*reinterpret_cast<volatile uint32_t *>(base+0x7019C);
+    if((ctl&0x80000000U) && ((ctl>>10)&7) && surf==0) {
+        *reinterpret_cast<volatile uint32_t *>(base+0x70180)=ctl&~0x80000000U;
+        *reinterpret_cast<volatile uint32_t *>(base+0x7019C)=surf;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+        const uint32_t sec=static_cast<uint32_t>(ns/1000000000ULL);
+        if(!watchRecord[0])watchRecord[2]=sec;
+        ++watchRecord[0];watchRecord[1]=ctl;watchRecord[3]=sec;
+        if(watchRecord[0]<=4 || (watchRecord[0]%64)==0)watchSave();
+    }
+    uint64_t deadline=0;clock_interval_to_deadline(20,kMillisecondScale,&deadline);
+    thread_call_enter_delayed(watchCall,deadline);
+}
+inline void startWatch() {
+    if(watchCall || !map)return;
+    watchCall=thread_call_allocate_with_priority(watchWork,nullptr,THREAD_CALL_PRIORITY_HIGH);
+    if(watchCall)thread_call_enter(watchCall);
+}
+
 inline IOReturn shutHandler(void *,void *,UInt32 type,IOService *,void *,vm_size_t) {
     if((type==kIOMessageSystemWillPowerOff || type==kIOMessageSystemWillRestart) && shutCall && map && !shutRecord[0]) {
         shutRecord[0]=type==kIOMessageSystemWillPowerOff?1:2;
@@ -196,6 +235,7 @@ inline IOReturn shutHandler(void *,void *,UInt32 type,IOService *,void *,vm_size
 // Call after native framebuffer start; opt out with -wex-noshutguard (checked by the caller).
 inline void armShutdown() {
     if(shutNotifier || !map)return;
+    watchEnabled=true;
     shutCall=thread_call_allocate_with_priority(shutWork,nullptr,THREAD_CALL_PRIORITY_HIGH);
     if(shutCall)shutNotifier=registerPrioritySleepWakeInterest(shutHandler,nullptr,nullptr);
 }
