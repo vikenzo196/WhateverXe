@@ -2,6 +2,32 @@
 
 [日本語](README_ja.md)
 
+> **About this fork (vikenzo196/WhateverXe, branch `fb-norefresh`).** It is upstream 0.8.3 plus the changes needed to
+> run a **Raptor Lake-H Iris Xe (A7A0) laptop with a 2880x1800 @ 120 Hz OLED driven over eDP with DSC** (Samsung
+> Galaxy Book3 Ultra). With the official build this board stops at the Type-C hook gate and never starts the native
+> framebuffer ([#43](https://github.com/b00t0x/WhateverXe/issues/43)). Fork-only boot arguments:
+>
+> | Boot argument | Purpose |
+> |---|---|
+> | `-wex-edp-keep` | keep the firmware-trained eDP link instead of retraining it |
+> | `-wex-edp-dsc` | keep the GOP's DSC / joiner configuration (needs `-wex-edp-keep`) |
+> | `-wex-edp-auxbl` | VESA DPCD AUX brightness (11-bit), with `SSDT-PNLF` |
+> | `-wex-edp-blank` | blank the panel for display sleep |
+> | `-wex-pm` | XE-PM: HWP rescale on hybrid P-cores, EPP 0, C-state tuning, D3 for unused PCI functions |
+> | `-wex-mtl-poshfix` | fix the TGL Metal driver's command-buffer leak (WindowServer memory growth) |
+> | `gfxrst=4` | skip the slow boot-image copy (about 10 s pause at the progress bar) |
+>
+> The fork also has:
+> - a WindowServer YUV patch, so full-screen video no longer crashes WindowServer. `-wex-ws-gva` disables it, but don't:
+>   on this machine the GVA path hangs the GPU;
+> - guards against white bands during the boot/shutdown handoff ([#189](https://github.com/b00t0x/WhateverXe/issues/189);
+>   opt out with `-wex-noplaneguard`, `-wex-noshutguard`, `-wex-noplanetrace`);
+> - GPU-reset recovery work;
+> - on-demand diagnostics (`WEXGTPower`, `sysctl debug.wexflip.arm`).
+>
+> It has been tested only on that laptop. Binary releases: [Releases](https://github.com/vikenzo196/WhateverXe/releases).
+> Full EFI: [GalaxyBook3Ultra-Hackintosh](https://github.com/vikenzo196/GalaxyBook3Ultra-Hackintosh).
+
 WhateverXe is a Lilu plugin, derived from WhateverGreen, that adapts Apple graphics drivers for selected Intel Xe-LP integrated GPUs.
 Use the latest releases of [WhateverXe](https://github.com/b00t0x/WhateverXe/releases) and [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) together. See [CHANGELOG](CHANGELOG.md) for release notes.
 
