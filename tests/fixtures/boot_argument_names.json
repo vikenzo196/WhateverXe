@@ -160,6 +160,7 @@
   "-wex-noplaneguard": [],
   "-wex-noshutguard": [],
   "-wex-noflipsysctl": [],
+  "-wex-norpsmax": [],
   "-wex-flip-trace": [],
   "-wex-flip-dedupe": [],
   "-wex-edp-auxbl": [],
