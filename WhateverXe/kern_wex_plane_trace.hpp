@@ -160,14 +160,10 @@ inline void start(IOPCIDevice *pci,bool guard) {
 
 // On-demand GT power sample (read-only, always-on/mirror range, no forcewake):
 // WEXGTPower = [ns, GEN12_RPSTAT1 0x1381B4 (CAGF [19:11] x 50/3 MHz), GEN6_GT_GFX_RC6
-// 0x138108 (1.28 us ticks), 0x145960, GT_PERF_STATUS 0x145948, RP_STATE_CAP 0x145998,
-// host RPS frequency queries, answered queries, last encoded request].
+// 0x138108 (1.28 us ticks), 0x145960, GT_PERF_STATUS 0x145948, RP_STATE_CAP 0x145998].
 // Each registry read of the property takes a fresh sample.
 inline bool gtPowerSerialize(void *,void *,OSSerialize *serializer) {
-    extern uint64_t tglHostRPSCalls,tglHostRPSAnswered;extern uint32_t tglHostRPSLast;
-    uint64_t q[9] {};
-    q[6]=__atomic_load_n(&tglHostRPSCalls,__ATOMIC_RELAXED);q[7]=__atomic_load_n(&tglHostRPSAnswered,__ATOMIC_RELAXED);
-    q[8]=__atomic_load_n(&tglHostRPSLast,__ATOMIC_RELAXED);
+    uint64_t q[6] {};
     if(map && map->getLength()>=0x146000) {
         auto base=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
         absolutetime_to_nanoseconds(mach_absolute_time(),q);

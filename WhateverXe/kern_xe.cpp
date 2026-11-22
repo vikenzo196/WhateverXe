@@ -907,16 +907,10 @@ bool tglEarlyReadSerialize(void *,void *,OSSerialize *serializer) {
 uintptr_t tglOriginalPMNotify {};
 uint64_t tglHostRPSCalls {}, tglHostRPSAnswered {};
 uint32_t tglHostRPSLast {}, tglHostRPSCap {};
-// -wex-norpsmax: keep the donor's requested frequency. By default any request
-// above RPn goes straight to RP0: compositing a video frame on the lock screen
-// takes close to the 8.3 ms budget at 120 Hz, and the donor settles at 1300 MHz.
-static int tglHostRPSMax=-1;
 static uint32_t tglHostRPSEncode(uint32_t requested,uint32_t boost,uint32_t caps) {
  const uint32_t lo=(caps>>16)&255,hi=caps&255;
  if(!lo || lo>hi || hi>85)return 0;
  uint32_t f=requested>boost ? requested:boost;
- if(tglHostRPSMax<0)tglHostRPSMax=checkKernelArgument("-wex-norpsmax")?0:1;
- if(tglHostRPSMax && f>lo)f=hi;
  if(f<lo)f=lo;if(f>hi)f=hi;
  return (f*3)<<23; // 50 MHz policy units -> 16.67 MHz hardware units
 }
