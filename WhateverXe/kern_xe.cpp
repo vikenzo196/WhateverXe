@@ -13,6 +13,7 @@
 #include "kern_dsi_native_backing.hpp"
 #include "kern_dsi_native_mode.hpp"
 #include "kern_xe.hpp"
+#include "kern_wex_plane_trace.hpp"
 #include "kern_framebuffer_donor.hpp"
 #include "kern_xelp_os.hpp"
 #include "kern_xelp_call_target.hpp"
@@ -8443,7 +8444,10 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	if(!featuresSelected)return false;
     if(Display13FBTopology::deferredBootPrepare(board,s->adlpDisplaySelected) && !s->prepareDisplay13BootScanout(pci))return false;
 	SYSLOG("igfx","Display13 native controller start enter offline=%u",display13Offline);
+	if(!checkKernelArgument("-wex-noplanetrace"))WEXPlaneTrace::start(pci,!checkKernelArgument("-wex-noplaneguard"));
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
+	WEXPlaneTrace::started();
+	if(!checkKernelArgument("-wex-noshutguard"))WEXPlaneTrace::armShutdown();
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);
