@@ -23,6 +23,7 @@
 #include <Headers/kern_crypto.hpp>
 #include "kern_alderlake_n.hpp"
 #include "kern_wex_plane_trace.hpp"
+#include "kern_wex_flip_trace.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
@@ -9717,6 +9718,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
 	WEXPlaneTrace::started();
 	if(!checkKernelArgument("-wex-noshutguard"))WEXPlaneTrace::armShutdown();
+	if(!checkKernelArgument("-wex-noflipsysctl"))WEXFlipTrace::install(WEXPlaneTrace::map);
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);

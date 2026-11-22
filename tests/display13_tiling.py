@@ -50,7 +50,8 @@ struct Handoff {
  bool adlpDisplaySelected=true,ready=true;unsigned calls=0;
  bool prepareDisplay13BootScanout(IOService *provider){assert(provider);++calls;return ready;}
 } handoff;
-namespace WEXPlaneTrace {inline void start(IOService *,bool){} inline void started(){} inline void armShutdown(){}}
+namespace WEXPlaneTrace {inline void start(IOService *,bool){} inline void started(){} inline void armShutdown(){} inline void *map=nullptr;}
+namespace WEXFlipTrace {inline void install(void *){}}
 static bool checkKernelArgument(const char *){return false;}
 bool prepare(IOService *that,IOService *provider){
  auto s=&handoff;auto pci=provider;
