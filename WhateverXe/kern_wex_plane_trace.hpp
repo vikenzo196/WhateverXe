@@ -1,9 +1,14 @@
-// Boot handoff trace for the primary plane (pipe A plane 1), cursor, PSR and the
-// eDP link. Diagnoses the ~1 s garbled boot logo seen when the native
-// framebuffer takes over the firmware scanout. Samples MMIO every 5 ms for 25 s
-// from just before native framebuffer start, stores an entry only on change,
-// and publishes the entries as WEXPlaneTrace in the registry root.
-// Opt out with -wex-noplanetrace (checked by the caller). Never writes hardware state.
+// Display handoff guards and trace for the primary plane (pipe A plane 1).
+// The native framebuffer switches plane 1A to Y-tiling while it still scans out
+// the linear firmware surface (and again on the way down), which shows the
+// firmware image as white bands. The guards keep plane 1A dark in those windows:
+// at boot until the native boot animation flips steadily, after boot whenever
+// surface 0 is scanned out Y-tiled, and after the power-off/restart notice.
+// The trace samples plane, cursor, PSR and eDP link registers every 5 ms for
+// 25 s from just before native framebuffer start, stores an entry only on
+// change, and publishes WEXPlaneTrace/WEXPlaneGuard in the registry root.
+// Opt out: -wex-noplanetrace (all), -wex-noplaneguard (boot guard),
+// -wex-noshutguard (surface 0 watch and power-off guard).
 #pragma once
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
