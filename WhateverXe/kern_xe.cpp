@@ -8139,18 +8139,18 @@ bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
- const uint32_t before=WEXTCDiag::peek(packet);
+ const uint32_t before=WEXTCDiag::peek(packet),before1=WEXTCDiag::peek1(packet,length);
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
  if(!ready){WEXTCDiag::recordAUX(2,port,false,false,command,length,before,before,0,kIOReturnNotReady);return kIOReturnNotReady;}
  const auto r=FunctionCast(wrapDisplay13I2CAUX,callbackXE->orgDisplay13I2CAUX)(port,command,packet,length,flag);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
  const uint32_t result=r ? r : complete ? 0 : kIOReturnNotReady;
- WEXTCDiag::recordAUX(2,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result);
+ WEXTCDiag::recordAUX(2,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result,before1,WEXTCDiag::peek1(packet,length));
  return result;
 }
 uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
- const uint32_t before=WEXTCDiag::peek(packet);
+ const uint32_t before=WEXTCDiag::peek(packet),before1=WEXTCDiag::peek1(packet,length);
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,true);
  const auto ddi=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : 7;
  IOLockUnlock(c.lock);if(!ready){WEXTCDiag::recordAUX(1,port,false,false,command,length,before,before,0,kIOReturnNotReady);return kIOReturnNotReady;}
@@ -8163,7 +8163,7 @@ uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,ui
  if(!protectedCompletion)adlnFault(c.bridge.state.faulted,__LINE__);
  IOLockUnlock(c.lock);
  const uint32_t result=r ? r : complete ? 0 : kIOReturnNotReady;
- WEXTCDiag::recordAUX(1,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result);
+ WEXTCDiag::recordAUX(1,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result,before1,WEXTCDiag::peek1(packet,length));
  return result;
 }
 

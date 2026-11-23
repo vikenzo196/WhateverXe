@@ -26,11 +26,14 @@ struct AUXEntry {
     uint32_t length;
     uint32_t before;   // first packet word before the call
     uint32_t after;    // first packet word after the call
+    uint32_t before1;  // second packet word before the call (write payload)
+    uint32_t after1;   // second packet word after the call (read data)
+    uint32_t us;       // microseconds since boot
     uint32_t donor;    // donor return value (0 when refused by the fork)
     uint32_t result;   // value returned to the donor
 };
 
-static constexpr unsigned AUXMax=128;
+static constexpr unsigned AUXMax=1024;
 inline AUXEntry aux[AUXMax];
 inline volatile uint32_t auxSeq;
 inline bool enabled;
@@ -39,14 +42,19 @@ inline IOMemoryMap *regMap;
 inline void init() {enabled=!checkKernelArgument("-wex-notcdiag");}
 
 inline uint32_t peek(const uint32_t *packet) {return packet ? *packet : 0;}
+inline uint32_t peek1(const uint32_t *packet,uint32_t length) {return packet && length>4 ? packet[1] : 0;}
 
+// The internal eDP (DDI 0) is not recorded: its backlight writes would flood the ring.
 inline void recordAUX(uint8_t kind,void *port,bool admitted,bool complete,uint32_t command,uint32_t length,
-                      uint32_t before,uint32_t after,uint32_t donor,uint32_t result) {
+                      uint32_t before,uint32_t after,uint32_t donor,uint32_t result,uint32_t before1=0,uint32_t after1=0) {
     if(!enabled)return;
-    const uint32_t n=__atomic_add_fetch(&auxSeq,1,__ATOMIC_ACQ_REL);
     uint8_t ddi=0xFF;
     if(port)ddi=static_cast<uint8_t>(*reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(port)+0x120));
-    aux[(n-1)%AUXMax]={n,kind,ddi,admitted,complete,command,length,before,after,donor,result};
+    if(ddi==0)return;
+    const uint32_t n=__atomic_add_fetch(&auxSeq,1,__ATOMIC_ACQ_REL);
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    aux[(n-1)%AUXMax]={n,kind,ddi,admitted,complete,command,length,before,after,before1,after1,
+        static_cast<uint32_t>(ns/1000),donor,result};
 }
 
 inline bool serializeAUX(void *,void *,OSSerialize *serializer) {
@@ -108,9 +116,20 @@ inline void bootStep(uint32_t step) {
     bootRecord[1]=step;bootRecord[2]=uptimeMs();bootSave();
 }
 
+// Keep the previous boot's record (a boot that hung never overwrote it with step 5).
+inline void keepPrevious() {
+    if(auto opts=IORegistryEntry::fromPath("/options",gIODTPlane)) {
+        if(auto old=OSDynamicCast(OSData,opts->getProperty("wex-tcboot"))) {
+            if(auto d=OSData::withData(old)){opts->setProperty("wex-tcboot-prev",d);d->release();}
+        }
+        opts->release();
+    }
+}
+
 // Framebuffer start entry: capture what the firmware left lit, then save.
 inline void bootEntry(IOPCIDevice *pci,bool bootReady) {
     if(!enabled || !pci)return;
+    keepPrevious();
     bootRecord[0]=1;bootRecord[3]=bootReady;
     if(auto map=pci->mapDeviceMemoryWithIndex(0)) {
         auto base=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
