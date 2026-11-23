@@ -8163,6 +8163,17 @@ uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,ui
  if(!protectedCompletion)adlnFault(c.bridge.state.faulted,__LINE__);
  IOLockUnlock(c.lock);
  const uint32_t result=r ? r : complete ? 0 : kIOReturnNotReady;
+ // Type-C DP-alt behind an MST branch (e.g. Dell WD19): the backend has no MST
+ // support and refuses MST ports, so hide DPCD MSTM_CAP (0x21 bit 0) and let the
+ // branch run in SST mode, like Linux i915.enable_dp_mst=0. -wex-tc-mst keeps it.
+ static int hideMST=-1;if(hideMST<0)hideMST=checkKernelArgument("-wex-tc-mst") ? 0 : 1;
+ if(hideMST && !result && ddi>=3 && ddi<7 && packet && (before>>28)==9) {
+  const uint32_t addr=(before>>8)&0xFFFFF,count=(before&0xFF)+1;
+  if(addr<=0x21 && addr+count>0x21) {
+   auto bytes=reinterpret_cast<uint8_t *>(packet);const auto index=1+(0x21-addr);
+   if(bytes[index]&1){bytes[index]&=~1U;WEXTCDiag::mstHidden++;}
+  }
+ }
  WEXTCDiag::recordAUX(1,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result,before1,WEXTCDiag::peek1(packet,length));
  return result;
 }

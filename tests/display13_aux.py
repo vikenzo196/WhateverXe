@@ -18,7 +18,7 @@ base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
 base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',keep+'\n'+functions)
 base=base.replace('struct OSObject {','void *nativePortObject=nullptr;\nstruct OSObject {').replace('return size;','return this==nativePortObject?0x700:size;')
 base=base.replace('bool adlnWriterMappingBound()', 'void adlnFault(bool &fault,unsigned){fault=true;}\nbool adlnWriterMappingBound()')
-base=base.replace('bool adlnWriterMappingBound()', 'namespace WEXTCDiag {inline uint32_t peek(const uint32_t *p){return p?*p:0;} inline uint32_t peek1(const uint32_t *p,uint32_t l){return p&&l>4?p[1]:0;} inline void recordAUX(uint8_t,void *,bool,bool,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t=0,uint32_t=0){}}\nbool adlnWriterMappingBound()',1)
+base=base.replace('bool adlnWriterMappingBound()', 'namespace WEXTCDiag {inline volatile uint32_t mstHidden;inline uint32_t peek(const uint32_t *p){return p?*p:0;} inline uint32_t peek1(const uint32_t *p,uint32_t l){return p&&l>4?p[1]:0;} inline void recordAUX(uint8_t,void *,bool,bool,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t=0,uint32_t=0){}}\nbool adlnWriterMappingBound()',1)
 header=(r/'WhateverXe/kern_xe.hpp').read_text()
 extra=header[header.index(' bool display13FBAUXHooksReady'):header.index(' mach_vm_address_t orgDisplay13TrainingPattern')]
 extra=extra.replace(' bool processDisplay13FramebufferAUX(KernelPatcher &,size_t,mach_vm_address_t,size_t);','').replace('mach_vm_address_t','uintptr_t')

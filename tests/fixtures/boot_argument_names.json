@@ -168,5 +168,6 @@
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
   "-wex-reset-nofix": [],
-  "-wex-stall-off": []
+  "-wex-stall-off": [],
+  "-wex-tc-mst": []
 }

@@ -36,6 +36,7 @@ struct AUXEntry {
 static constexpr unsigned AUXMax=1024;
 inline AUXEntry aux[AUXMax];
 inline volatile uint32_t auxSeq;
+inline volatile uint32_t mstHidden;
 inline bool enabled;
 inline IOMemoryMap *regMap;
 
@@ -184,6 +185,9 @@ inline void install(IOMemoryMap *map) {
     if(auto s=OSSerializer::forTarget(nullptr,serializeAUX)){root->setProperty("WEXAUXTrace",s);s->release();}
     if(auto s=OSSerializer::forTarget(nullptr,serializeRegs)){root->setProperty("WEXTCRegs",s);s->release();}
     if(auto s=OSSerializer::forTarget(nullptr,serializeHooks)){root->setProperty("WEXTCHooks",s);s->release();}
+    if(auto s=OSSerializer::forTarget(nullptr,[](void *,void *,OSSerialize *z){
+        auto n=OSNumber::withNumber(__atomic_load_n(&mstHidden,__ATOMIC_RELAXED),32);if(!n)return false;
+        const bool ok=n->serialize(z);n->release();return ok;})){root->setProperty("WEXTCMSTHidden",s);s->release();}
 }
 
 }
