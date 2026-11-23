@@ -52,6 +52,9 @@ namespace XELP { namespace DSI { struct Profile; } }
 class XE {
 public:
 	void init();
+	// eDP PSR1 experiment (debug.wexpsr): seconds>0 enable with auto-off, -1 enable, 0 disable.
+	static int edpPSRRequest(int seconds);
+	static void edpPSRDisableTimed();
     void captureFirmware(IOPCIDevice *,const XELP::Profile &);
     void selectProfile(const XELP::Profile &profile);
 	void deinit();

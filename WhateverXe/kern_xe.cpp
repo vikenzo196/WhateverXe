@@ -8027,6 +8027,131 @@ static uint64_t display13EDPAuxBLLastNs=0;
 static bool display13EDPAuxBLCapsValid=false;
 static uint8_t display13EDPAuxBLCaps[3] {};
 static uint16_t display13EDPAuxBLMax=0;
+
+// ---- eDP PSR1 experiment (runtime only, off by default) ----
+// debug.wexpsr.enable: N>0 enables PSR1 on the kept eDP (transcoder A) for N
+// seconds, then it switches itself off; -1 keeps it on; 0 switches it off.
+// debug.wexpsr.status reports the source registers and the sink setting.
+// Sequence and bits follow Linux intel_psr.c for display 12/13 PSR1:
+// sink DPCD 0x170 first, then EDP_PSR_DEBUG mask, then EDP_PSR_CTL enable;
+// disable clears the enable bit, waits for the IDLE state, then clears 0x170.
+// Display 12+ Linux keeps link standby off: the main link turns off in PSR and
+// the source retrains it with TPS1/TPS3 on exit (2500 us each, the safest timing).
+namespace WEXPSR {
+constexpr uint32_t Ctl=0x60800,Status=0x60840,Perf=0x60844,Debug=0x60860;
+constexpr uint32_t Enable=1U<<31,KeepCtx=1U<<29,CRC=1U<<10,TP1TP3=1U<<11;
+static IOMemoryMap *map=nullptr;
+static IOLock *lock=nullptr;
+static thread_call_t offCall=nullptr;
+static int requested=0;
+struct Record {
+    uint32_t version,requests,enables,disables,autoOffs,failures,stage,result;
+    uint32_t ctlBefore,ctlAfter,statusAfter,debugBefore,debugAfter,sinkBefore,sinkAfter,waitMs;
+} record {1};
+static uint32_t rd(uint32_t r){return *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(map->getVirtualAddress())+r);}
+static void wr(uint32_t r,uint32_t v){*reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(map->getVirtualAddress())+r)=v;}
+static void publish() {
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXPSR",&record,sizeof(record));
+}
+static int enableHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=requested;
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<-1 || value>3600)return EINVAL;
+    return XE::edpPSRRequest(value);
+}
+static char statusText[160];
+static int statusHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    if(map)snprintf(statusText,sizeof(statusText),"ctl=%08x status=%08x perf=%u debug=%08x sink=%02x requested=%d",
+        rd(Ctl),rd(Status),rd(Perf),rd(Debug),record.sinkAfter,requested);
+    else snprintf(statusText,sizeof(statusText),"unavailable");
+    return sysctl_handle_string(oidp,statusText,sizeof(statusText),req);
+}
+SYSCTL_NODE(_debug, OID_AUTO, wexpsr, CTLFLAG_RW, 0, "WhateverXe eDP PSR1 experiment");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, enable, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, enableHandler, "I", "seconds (-1 on, 0 off)");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, status, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, statusHandler, "A", "PSR registers");
+static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
+static void install(IOMemoryMap *m) {
+    if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
+    lock=IOLockAlloc();offCall=thread_call_allocate(offWork,nullptr);
+    if(!lock || !offCall)return;
+    map=m;map->retain();
+    sysctl_register_oid(&sysctl__debug_wexpsr);
+    sysctl_register_oid(&sysctl__debug_wexpsr_enable);
+    sysctl_register_oid(&sysctl__debug_wexpsr_status);
+    publish();
+}
+}
+void XE::edpPSRDisableTimed() {
+    if(WEXPSR::lock)IOLockLock(WEXPSR::lock),++WEXPSR::record.autoOffs,IOLockUnlock(WEXPSR::lock);
+    edpPSRRequest(0);
+}
+int XE::edpPSRRequest(int seconds) {
+    using namespace WEXPSR;
+    if(!lock || !map)return ENODEV;
+    IOLockLock(lock);
+    auto &r=record;++r.requests;r.stage=1;r.result=0;
+    auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
+    int error=0;
+    const uint32_t ctl=rd(Ctl);r.ctlBefore=ctl;r.debugBefore=rd(Debug);
+    if(seconds) {
+        // Only with the eDP transcoder and pipe A running and a known panel port.
+        r.stage=2;
+        const bool running=(rd(0x60400)&Enable) && (rd(0x70008)&Enable);
+        uint8_t sink=0;
+        if(!port || !running)error=ENXIO;
+        else if((r.result=wrapDisplay13ReadAUX(port,0x170,&sink,1))!=0)error=EIO;
+        if(!error) {
+            r.sinkBefore=sink;r.stage=3;
+            if(!(ctl&Enable)) {
+                uint8_t value=0x05; // DP_PSR_ENABLE | DP_PSR_CRC_VERIFICATION
+                IOLockLock(display13EDPAuxBLLock);r.result=wrapDisplay13WriteAUX(port,0x170,&value,1);IOLockUnlock(display13EDPAuxBLLock);
+                if(r.result)error=EIO;
+                else {
+                    uint8_t check=0;wrapDisplay13ReadAUX(port,0x170,&check,1);r.sinkAfter=check;
+                    if((check&5)!=5)error=EIO;
+                }
+                if(!error) {
+                    r.stage=4;
+                    wr(Debug,(1U<<28)|(1U<<27)|(1U<<26)|(1U<<25)); // mask MAX_SLEEP, LPSP, MEMUP, HPD (Linux eDP)
+                    r.debugAfter=rd(Debug);
+                    const uint32_t value32=(ctl&KeepCtx)|Enable|(0x1fU<<20)|TP1TP3|CRC|(2U<<8)|(2U<<4)|6U;
+                    wr(Ctl,value32);
+                    ++r.enables;r.stage=5;
+                }
+            }
+        }
+        if(!error) {
+            requested=seconds;
+            thread_call_cancel(offCall);
+            if(seconds>0) {
+                uint64_t deadline=0;clock_interval_to_deadline(static_cast<uint32_t>(seconds),kSecondScale,&deadline);
+                thread_call_enter_delayed(offCall,deadline);
+            }
+        }
+    } else {
+        r.stage=10;thread_call_cancel(offCall);
+        if(ctl&Enable) {
+            wr(Ctl,ctl&~Enable);
+            unsigned waited=0;
+            while(((rd(Status)>>29)&7) && waited<2000){IOSleep(1);++waited;}
+            r.waitMs=waited;
+            if(waited>=2000)error=ETIMEDOUT;
+            ++r.disables;
+        }
+        if(port) {
+            uint8_t value=0;
+            IOLockLock(display13EDPAuxBLLock);const auto w=wrapDisplay13WriteAUX(port,0x170,&value,1);IOLockUnlock(display13EDPAuxBLLock);
+            if(w && !error)error=EIO;
+            uint8_t check=0xff;wrapDisplay13ReadAUX(port,0x170,&check,1);r.sinkAfter=check;
+        }
+        requested=0;r.stage=11;
+    }
+    r.ctlAfter=rd(Ctl);r.statusAfter=rd(Status);
+    if(error)++r.failures;
+    IOLockUnlock(lock);publish();
+    return error;
+}
 void XE::display13EDPAuxBLApply(uint32_t brightness) {
  namespace A=Display13EDPAuxBL;
  auto port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
@@ -9801,7 +9926,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	WEXPlaneTrace::started();
 	if(!checkKernelArgument("-wex-noshutguard"))WEXPlaneTrace::armShutdown();
 	if(!checkKernelArgument("-wex-noflipsysctl"))WEXFlipTrace::install(WEXPlaneTrace::map);
-	WEXTCDiag::install(WEXPlaneTrace::map);WEXTCDiag::bootStep(started?5:0x105+0x100);
+	WEXTCDiag::install(WEXPlaneTrace::map);WEXPSR::install(WEXPlaneTrace::map);WEXTCDiag::bootStep(started?5:0x105+0x100);
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);
