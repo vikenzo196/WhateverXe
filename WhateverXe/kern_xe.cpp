@@ -8151,6 +8151,60 @@ static int dcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) 
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dmc, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dmcHandler, "I", "1 loads the ADL-P main DMC");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dc, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dcHandler, "I", "seconds of DC5 allowed");
+// debug.wexpsr.pw2=N: for N seconds drop the firmware-borrowed driver requests
+// for PW_C, PW_B and PW2 (XE_LPD request bits 15, 13, 3) when no lease uses
+// pipes B/C or PW2, so DC5 can be entered; then request them again in the
+// reverse order and wait for their state bits. 0 restores now.
+static thread_call_t pwOffCall=nullptr;
+static int pwRequested=0;
+static uint32_t pwDropped=0;
+static uint32_t pwResult[6];
+static bool pwRestoreLocked() {
+    if(!pwDropped)return true;
+    const uint32_t order[3]={1U<<3,1U<<13,1U<<15}; // PW2, PW_B, PW_C
+    bool ok=true;
+    for(auto req:order)if(pwDropped&req) {
+        wr(0x45404,rd(0x45404)|req);
+        unsigned waited=0;while(!(rd(0x45404)&(req>>1)) && waited<100){IODelay(100);++waited;}
+        if(!(rd(0x45404)&(req>>1)))ok=false;
+    }
+    pwDropped=0;return ok;
+}
+static void pwOffWork(thread_call_param_t,thread_call_param_t) {
+    if(!lock)return;IOLockLock(lock);pwResult[3]=pwRestoreLocked();pwRequested=0;pwResult[4]=rd(0x45404);IOLockUnlock(lock);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXPW2",pwResult,sizeof(pwResult));
+}
+static int pwHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=pwRequested;
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<0 || value>600)return EINVAL;
+    if(!map || !lock || !pwOffCall)return ENODEV;
+    IOLockLock(lock);
+    thread_call_cancel(pwOffCall);
+    int result=0;
+    if(!value){pwResult[3]=pwRestoreLocked();pwRequested=0;}
+    else {
+        auto &c=display13FBPower;uint32_t refs=0;
+        if(c.lock){IOLockLock(c.lock);refs=c.bridge.state.refs[1]|c.bridge.state.refs[3]|c.bridge.state.refs[4];IOLockUnlock(c.lock);}
+        pwResult[0]=1;pwResult[1]=refs;pwResult[2]=rd(0x45404);
+        // Pipes B/C must be off: TRANSCONF B/C enable bits clear.
+        const bool pipesOff=!(rd(0x71008)&(1U<<31)) && !(rd(0x72008)&(1U<<31));
+        if(refs || !pipesOff)result=EBUSY;
+        else {
+            const uint32_t order[3]={1U<<15,1U<<13,1U<<3}; // PW_C, PW_B, PW2
+            for(auto req:order)if(rd(0x45404)&req){wr(0x45404,rd(0x45404)&~req);pwDropped|=req;}
+            pwRequested=value;
+            uint64_t deadline=0;clock_interval_to_deadline(static_cast<uint32_t>(value),kSecondScale,&deadline);
+            thread_call_enter_delayed(pwOffCall,deadline);
+        }
+    }
+    pwResult[4]=rd(0x45404);pwResult[5]=pwDropped;
+    IOLockUnlock(lock);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXPW2",pwResult,sizeof(pwResult));
+    return result;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pw2, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pwHandler, "I", "seconds with PW2/B/C released");
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
 static void install(IOMemoryMap *m) {
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
@@ -8164,6 +8218,8 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_dmc);
     sysctl_register_oid(&sysctl__debug_wexpsr_dc);
     dcOffCall=thread_call_allocate(dcOffWork,nullptr);
+    sysctl_register_oid(&sysctl__debug_wexpsr_pw2);
+    pwOffCall=thread_call_allocate(pwOffWork,nullptr);
     publish();
 }
 }
