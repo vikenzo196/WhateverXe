@@ -8012,9 +8012,12 @@ struct Display13EDPAuxBLRecord {
  // and the index of the next slot in each ring.
  uint32_t reqNext,writeNext,req[32],write[32];
  uint32_t maxLevel; // level range the panel accepts (0x724 bit count)
+ // First-call read-only dumps for panel power work: DPCD 0x000..0x00F (receiver
+ // caps), 0x070..0x07F (PSR/PSR2 caps) and 0x2200..0x220F (extended caps).
+ uint8_t dump000[16],dump070[16],dump2200[16];
 };
 enum Display13EDPAuxBLStage : uint32_t {NoPort=1,TCON,CapsRead,StateRead,Unusable,Written,WriteFailed};
-static Display13EDPAuxBLRecord display13EDPAuxBLState {10};
+static Display13EDPAuxBLRecord display13EDPAuxBLState {11};
 static mach_vm_address_t display13EDPAuxBLPortByDDI=0;
 static bool display13EDPAuxBLIntel() {
  static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-auxbl-intel") ? 1 : 0;
@@ -8059,6 +8062,9 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
    for(unsigned o=0;o<sizeof(r.dump700);o+=16)
     wrapDisplay13ReadAUX(port,0x700+o,r.dump700+o,sizeof(r.dump700)-o<16 ? sizeof(r.dump700)-o : 16);
    memcpy(r.intel,r.dump340,sizeof(r.intel));
+   wrapDisplay13ReadAUX(port,0x000,r.dump000,sizeof(r.dump000));
+   wrapDisplay13ReadAUX(port,0x070,r.dump070,sizeof(r.dump070));
+   wrapDisplay13ReadAUX(port,0x2200,r.dump2200,sizeof(r.dump2200));
    e=wrapDisplay13ReadAUX(port,A::CapsAddress,display13EDPAuxBLCaps,sizeof(display13EDPAuxBLCaps));
    uint8_t bits[3] {};
    if(!e)e=wrapDisplay13ReadAUX(port,A::BitCountAddress,bits,sizeof(bits));
