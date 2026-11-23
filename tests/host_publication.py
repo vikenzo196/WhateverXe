@@ -399,6 +399,7 @@ for(unsigned rev:{0U,12U,255U})for(bool override:{false,true}) {
 puts("PASS actual host admission: absent/unpublished/unsupported GPUs never enter Xe; published PCI reads precede selected-driver dispatch");}
 '''
 with tempfile.TemporaryDirectory(prefix='wxe-host-') as d:
+ code=code.replace('#include','unsigned long long gWEXFBHandleEvent=0;\n#include',1) if 'gWEXFBHandleEvent=0' not in code else code
  p=Path(d);(p/'test.cpp').write_text(code)
  subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined','-I'+str(r/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)

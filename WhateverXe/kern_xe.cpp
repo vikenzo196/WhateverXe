@@ -9430,10 +9430,14 @@ uint32_t xePmS2idleSleeps();
 static uint32_t display13EDPBlankSleepsSeen=0;
 // handleEvent is protected in IOFramebuffer; reach it through a member pointer
 // named via a derived class (never instantiated).
-struct Display13FBEventAccess : IOFramebuffer {
- static IOReturn send(IOFramebuffer *fb,IOIndex event,void *info) {
-  auto member=&Display13FBEventAccess::handleEvent;
-  return (fb->*member)(event,info);
+// IOGraphicsFamily is not in our dependency set: no IOFramebuffer symbol may be
+// imported (metaClass, non-virtual calls). A virtual call through a derived
+// pointer uses the vtable slot from the header only.
+extern mach_vm_address_t gWEXFBHandleEvent; // kern_host.cpp, solved when IOGraphicsFamily loads
+struct Display13FBEventAccess {
+ static IOReturn send(IOService *fb,IOIndex event,void *info) {
+  if(!gWEXFBHandleEvent)return kIOReturnUnsupported;
+  return reinterpret_cast<IOReturn (*)(IOService *,IOIndex,void *)>(gWEXFBHandleEvent)(fb,event,info);
  }
 };
 bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
@@ -9442,7 +9446,7 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
   const auto sleeps=xePmS2idleSleeps();
   if(sleeps!=display13EDPBlankSleepsSeen) {
    display13EDPBlankSleepsSeen=sleeps;
-   auto framebuffer=OSDynamicCast(IOFramebuffer,fb);
+   auto framebuffer=fb->metaCast("IOFramebuffer") ? fb : nullptr;
    const IOReturn r=framebuffer ? Display13FBEventAccess::send(framebuffer,kIOFBNotifyDidWake,reinterpret_cast<void *>(1)) : kIOReturnUnsupported;
    uint32_t record[]={1,sleeps,static_cast<uint32_t>(r),framebuffer!=nullptr};
    IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankDidWake",record,sizeof(record));

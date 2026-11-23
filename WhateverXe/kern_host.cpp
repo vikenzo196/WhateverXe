@@ -27,6 +27,7 @@ XeHost *XeHost::callbackHost;
 struct FramebufferViewer : public IOFramebuffer {
  static IOMemoryMap *&getVramMap(IOFramebuffer *fb) { return static_cast<FramebufferViewer *>(fb)->fVramMap; }
 };
+mach_vm_address_t gWEXFBHandleEvent=0;
 static const char *graphicsPath[] { "/System/Library/Extensions/IOGraphicsFamily.kext/IOGraphicsFamily" };
 static KernelPatcher::KextInfo graphics { "com.apple.iokit.IOGraphicsFamily",graphicsPath,arrsize(graphicsPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 static const char *accelPath[] { "/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2" };
@@ -220,6 +221,10 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
  if(graphics.loadIndex==index) {
   if(graphicsSeen)return;
   graphicsSeen=true;
+  // IOFramebuffer::handleEvent is non-virtual and IOGraphicsFamily is not a link
+  // dependency: resolve it here for the s2idle wake notification (kern_xe.cpp).
+  gWEXFBHandleEvent=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN13IOFramebuffer11handleEventEiPv",address,size);
+  patcher.clearError();
   if(systemWakeRecovery) {
    const char *sym="__ZN13IOFramebuffer16setWSAAAttributeEjj";
    // Lilu resolves the symbol, verifies the image range, and builds the
