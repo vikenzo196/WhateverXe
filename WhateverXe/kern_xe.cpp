@@ -26,6 +26,7 @@
 #include "kern_wex_flip_trace.hpp"
 #include "kern_wex_tc_diag.hpp"
 #include "kern_wex_dmc_adlp.hpp"
+#include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
@@ -9421,7 +9422,35 @@ bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_ad
 }
 // Returns true when the kept eDP transition was handled here (result set);
 // false means the caller continues with the native/0.8.0 power path.
+uint32_t xePmS2idleSleeps();
+// IOFramebuffer clears pagingState for every framebuffer at system sleep and
+// only sets it again from the driver's kIOFBNotifyDidWake (handleEvent on the
+// controller power thread). The kept eDP framebuffer skips the donor's native
+// wake, so after an s2idle sleep send that event ourselves on its wake.
+static uint32_t display13EDPBlankSleepsSeen=0;
+// handleEvent is protected in IOFramebuffer; reach it through a member pointer
+// named via a derived class (never instantiated).
+struct Display13FBEventAccess : IOFramebuffer {
+ static IOReturn send(IOFramebuffer *fb,IOIndex event,void *info) {
+  auto member=&Display13FBEventAccess::handleEvent;
+  return (fb->*member)(event,info);
+ }
+};
 bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
+ const bool handled=display13EDPBlankPowerImpl(fb,state,result);
+ if(handled && state==Display13EDPBlank::Wake && fb) {
+  const auto sleeps=xePmS2idleSleeps();
+  if(sleeps!=display13EDPBlankSleepsSeen) {
+   display13EDPBlankSleepsSeen=sleeps;
+   auto framebuffer=OSDynamicCast(IOFramebuffer,fb);
+   const IOReturn r=framebuffer ? Display13FBEventAccess::send(framebuffer,kIOFBNotifyDidWake,reinterpret_cast<void *>(1)) : kIOReturnUnsupported;
+   uint32_t record[]={1,sleeps,static_cast<uint32_t>(r),framebuffer!=nullptr};
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankDidWake",record,sizeof(record));
+  }
+ }
+ return handled;
+}
+bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &result) {
  namespace B=Display13EDPBlank;
  if(!display13EDPBlankActive)return false;
  auto &c=display13FBPower;auto &b=display13EDPBlankState;

@@ -158,6 +158,7 @@ static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
 static constexpr unsigned xpGpe0Len = 16;
 static uint8_t gXpGpeEn[16];
 bool xePmS2idleActive() { return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
+uint32_t xePmS2idleSleeps() { return __atomic_load_n(&gXpSleepCount, __ATOMIC_ACQUIRE); }
 static void xpFakeSleep(void *) {
 	uint8_t snap[xpGpe0Len];
 	// Only GPEs the OS armed for wake (GPE0_EN, 0x1870) may end the wait; others (EC chatter) are ignored.

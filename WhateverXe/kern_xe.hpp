@@ -302,6 +302,7 @@ private:
     static uint64_t wrapDisplay13FlipVBL(void *,uint32_t);
     // Called from wrapDisplay13SetPowerState (0.8.0 owns the setFramebufferPowerState route).
     static bool display13EDPBlankPower(IOService *,uint32_t,uint32_t &);
+    static bool display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &result);
     static bool display13EDPBlankActive;
     static uint32_t wrapDisplay13SetPowerState(IOService *,uint32_t);
     mach_vm_address_t orgDSITransaction[5] {};
