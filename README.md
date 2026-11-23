@@ -17,6 +17,17 @@
 > | `-wex-mtl-poshfix` | fix the TGL Metal driver's command-buffer leak (WindowServer memory growth) |
 > | `gfxrst=4` | skip the slow boot-image copy (about 10 s pause at the progress bar) |
 >
+> **USB-C display output (DP alt mode)** works on this laptop since this fork: a Dell WD19 dock (USB-C, with an MST
+> hub) drives one external monitor, extended or mirrored, plugged at boot or hot-plugged, with the dock's USB and
+> Ethernet. Three changes make it work:
+> - DPCD `MSTM_CAP` is hidden on the Type-C ports, so an MST branch runs in SST mode (one monitor). The backend has no
+>   MST support. `-wex-tc-mst` keeps MST visible.
+> - When an output is added with the kept eDP pipe running, CDCLK is not stopped (`-wex-cdclk-stop` restores the
+>   refusal) and is not raised to the top table entry without a watermark certificate: the running frequency is kept
+>   if it is higher than the request floor (`-wex-cdclk-raise` restores the refusal).
+> - Type-C diagnostics: `WEXAUXTrace`, `WEXTCHooks`, `WEXTCRegs`, `WEXDisplay13TCLightUpWhy` in the registry and
+>   `wex-tcboot` / `wex-tcboot-prev` in NVRAM (boot progress of the framebuffer start). `-wex-notcdiag` disables them.
+>
 > The fork also has:
 > - a WindowServer YUV patch, so full-screen video no longer crashes WindowServer. `-wex-ws-gva` disables it, but don't:
 >   on this machine the GVA path hangs the GPU;
