@@ -139,6 +139,65 @@ SYSCTL_INT(_debug_xepm, OID_AUTO, cst, CTLFLAG_RD, &gXpCst, 0, "1 = C8/C10 on");
 SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
 SYSCTL_INT(_debug_xepm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
 
+// ─── 6: s2idle-style system sleep (experimental, off by default) ───────────────────────────────────────────────
+// This firmware has no working S3 (it is Modern Standby only, FACP LowPowerS0Idle): entering S3 resets the machine.
+// With sysctl debug.xepm.s2idle=1, acpi_sleep_kernel keeps its whole path (drivers already powered down, other CPUs
+// off, _PTS run by the platform) but its final callback, which would write SLP_EN, is replaced: the boot CPU polls
+// the ACPI event registers and returns when a new GPE0 status bit (lid, power button, EC, ...) or the RTC alarm
+// appears. XNU then runs its normal resume path ("returns if sleep failed"). Ports from FACP: PM1a_EVT 0x1800,
+// GPE0_BLK 0x1860 (32 bytes: 16 status + 16 enable).
+typedef void (*xpAcpiSleepCallback)(void *);
+static mach_vm_address_t gXpOrgAcpiSleep = 0;
+static int gXpSleepMode = 0, gXpSleepRoute = 0;
+static uint32_t gXpSleepCount = 0, gXpSleepReason = 0;
+static uint64_t gXpSleepLoops = 0;
+static inline uint8_t xpInb(uint16_t port) { uint8_t v; asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v; }
+static inline uint16_t xpInw(uint16_t port) { uint16_t v; asm volatile("inw %1, %0" : "=a"(v) : "Nd"(port)); return v; }
+static inline void xpOutw(uint16_t port, uint16_t v) { asm volatile("outw %0, %1" : : "a"(v), "Nd"(port)); }
+static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
+static constexpr unsigned xpGpe0Len = 16;
+static void xpFakeSleep(void *) {
+	uint8_t snap[xpGpe0Len];
+	for (unsigned i = 0; i < xpGpe0Len; i++) snap[i] = xpInb(xpGpe0Sts + i);
+	xpOutw(xpPm1Sts, (1U << 8) | (1U << 10));   // clear PWRBTN_STS and RTC_STS (write 1 to clear)
+	uint32_t reason = 0; uint64_t loops = 0;
+	while (!reason) {
+		const uint16_t pm1 = xpInw(xpPm1Sts);
+		if (pm1 & (1U << 8)) reason = 1;
+		else if (pm1 & (1U << 10)) reason = 2;
+		else for (unsigned i = 0; i < xpGpe0Len; i++) {
+			const uint8_t g = xpInb(xpGpe0Sts + i), rise = g & ~snap[i];
+			if (rise) { reason = 0x100 + i * 8 + __builtin_ctz(rise); break; }
+			snap[i] = g;
+		}
+		for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
+		loops++;
+	}
+	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
+	gXpSleepReason = reason; gXpSleepLoops = loops; gXpSleepCount++;
+}
+static void xpAcpiSleepKernel(xpAcpiSleepCallback func, void *refcon) {
+	if (gXpSleepMode == 1) func = xpFakeSleep;
+	FunctionCast(xpAcpiSleepKernel, gXpOrgAcpiSleep)(func, refcon);
+}
+static int xpSleepHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gXpSleepMode;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 0 || value > 1) return EINVAL;
+	if (!gXpOrgAcpiSleep) return ENODEV;
+	gXpSleepMode = value;
+	return 0;
+}
+static char gXpSleepText[96];
+static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu",
+		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops);
+	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
+}
+SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, s2stat, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, xpSleepStatHandler, "A", "s2idle status");
+
 void xePmInstall(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-wex-pm")) return;
 	gXpOn = true;
@@ -174,6 +233,20 @@ void xePmInstall(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_xepm_cst);
 	sysctl_register_oid(&sysctl__debug_xepm_d3);
 	sysctl_register_oid(&sysctl__debug_xepm_route);
+	{
+		const mach_vm_address_t fn = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_kernel");
+		patcher.clearError();
+		static const uint8_t pro[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};   // push rbp; mov rbp,rsp; push r15; push r14
+		bool ok = fn != 0;
+		for (size_t i = 0; ok && i < sizeof(pro); i++) if (reinterpret_cast<const uint8_t *>(fn)[i] != pro[i]) ok = false;
+		if (ok) {
+			gXpOrgAcpiSleep = patcher.routeFunction(fn, reinterpret_cast<mach_vm_address_t>(xpAcpiSleepKernel), true);
+			if (patcher.getError() != KernelPatcher::Error::NoError) { gXpOrgAcpiSleep = 0; patcher.clearError(); }
+		}
+		gXpSleepRoute = gXpOrgAcpiSleep ? 1 : (fn ? 3 : 2);
+		sysctl_register_oid(&sysctl__debug_xepm_s2idle);
+		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
+	}
 	uint64_t dl;
 	thread_call_t t20 = thread_call_allocate(xpApply, nullptr), t60 = thread_call_allocate(xpApply, nullptr);
 	clock_interval_to_deadline(20, kSecondScale, &dl);
