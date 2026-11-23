@@ -7623,7 +7623,33 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
             else reinterpret_cast<void (*)(void *,void *,void *)>(self->display13TCPackets)(controller,fb,path);
         }
     } io{self,controller,fb,path,port,timing};
-    IOLockLock(c.lock);io.ddi=display13TCTarget(port);io.pipeIndex=Display13FBMemory::field<uint32_t>(path,0x3640);IOLockUnlock(c.lock);
+    IOLockLock(c.lock);io.ddi=display13TCTarget(port);io.pipeIndex=Display13FBMemory::field<uint32_t>(path,0x3640);
+    if(io.ddi==UINT32_MAX) {
+        // Diagnostics: which display13TCTarget condition refused this port.
+        uint32_t why=0;
+        why|=!self->display13FBTCHooksReady?1U:0;why|=!c.tcSupported?2U:0;why|=!c.controller?4U:0;why|=!c.bridge.begun?8U:0;
+        why|=c.tcBankFaulted?0x10U:0;why|=c.bridge.state.faulted?0x20U:0;why|=c.clockFaulted?0x40U:0;
+        uint32_t cfg0=UINT32_MAX,size=0,field120=UINT32_MAX;
+        if(!port)why|=0x80U;
+        else {
+            size=port->getMetaClass()->getClassSize();
+            if(size<0x6b0)why|=0x100U;
+            else {
+                auto config=Display13FBMemory::field<uint32_t *>(port,0x548);field120=Display13FBMemory::field<uint32_t>(port,0x120);
+                if(!config)why|=0x200U;
+                else {
+                    cfg0=config[0];
+                    why|=!self->adlnOutputWiring.matches(config)?0x400U:0;why|=(config[0]<3 || config[0]>6)?0x800U:0;
+                    why|=!Display13FBTopology::bound(self->adlnPlatform,config,config[0])?0x1000U:0;
+                    why|=Display13FBMemory::field<void *>(port,0x578)!=c.access?0x2000U:0;
+                    why|=field120!=config[0]?0x4000U:0;
+                }
+            }
+        }
+        uint32_t whyRecord[]={1,why,cfg0,field120,size,c.firstFaultLine};
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCLightUpWhy",whyRecord,sizeof(whyRecord));
+    }
+    IOLockUnlock(c.lock);
     io.dp=io.ddi<7 && (self->adlnOutputWiring.dp&(1U<<io.ddi));
     const auto result=io.dp?Display13TC::lightUpDP(io,io.ddi,io.pipeIndex):Display13TC::lightUpTMDS(io,io.ddi,io.pipeIndex);
     uint32_t record[]={1,io.ddi,io.pipeIndex,uint32_t(result.stage),result.status};
