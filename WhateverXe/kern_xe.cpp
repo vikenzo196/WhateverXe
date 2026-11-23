@@ -8205,6 +8205,30 @@ static int pwHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) 
     return result;
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pw2, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pwHandler, "I", "seconds with PW2/B/C released");
+// Read-only PCH PMC snapshot (PWRMBASE 0xFE000000 on ADL/RPL, see DSDT PWRM):
+// LTR values 0x1B60..0x1BCC, LTR ignore 0x1B0C, SLP_S0 residency 0x193C,
+// PPFEAR IP power-gating status 0x1D90..0x1D9F, LPM status 0x1C3C..0x1C58 and
+// live status 0x1C5C..0x1C78 (Linux intel/pmc cnp/tgl/adl offsets). As raw words.
+static IOMemoryMap *pmcMap=nullptr;
+static char pmcText[1024];
+static int pmcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    if(!pmcMap) {
+        if(auto md=IOMemoryDescriptor::withPhysicalAddress(0xFE000000ULL,0x2000,kIODirectionIn)) {
+            pmcMap=md->map(kIOMapInhibitCache|kIOMapReadOnly);md->release();
+        }
+    }
+    if(!pmcMap){snprintf(pmcText,sizeof(pmcText),"unmapped");return sysctl_handle_string(oidp,pmcText,sizeof(pmcText),req);}
+    auto base=reinterpret_cast<volatile uint8_t *>(pmcMap->getVirtualAddress());
+    auto r=[base](uint32_t o){return *reinterpret_cast<volatile uint32_t *>(base+o);};
+    size_t used=snprintf(pmcText,sizeof(pmcText),"ign=%08x s0=%08x ltr=",r(0x1B0C),r(0x193C));
+    for(uint32_t o=0x1B60;o<=0x1BCC && used<sizeof(pmcText);o+=4)used+=snprintf(pmcText+used,sizeof(pmcText)-used,"%08x,",r(o));
+    if(used<sizeof(pmcText))used+=snprintf(pmcText+used,sizeof(pmcText)-used," pg=");
+    for(uint32_t o=0x1D90;o<0x1DA0 && used<sizeof(pmcText);o+=4)used+=snprintf(pmcText+used,sizeof(pmcText)-used,"%08x,",r(o));
+    if(used<sizeof(pmcText))used+=snprintf(pmcText+used,sizeof(pmcText)-used," lpm=");
+    for(uint32_t o=0x1C3C;o<0x1C7C && used<sizeof(pmcText);o+=4)used+=snprintf(pmcText+used,sizeof(pmcText)-used,"%08x,",r(o));
+    return sysctl_handle_string(oidp,pmcText,sizeof(pmcText),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pmc, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC LTR / power gating snapshot");
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
 static void install(IOMemoryMap *m) {
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
@@ -8220,6 +8244,7 @@ static void install(IOMemoryMap *m) {
     dcOffCall=thread_call_allocate(dcOffWork,nullptr);
     sysctl_register_oid(&sysctl__debug_wexpsr_pw2);
     pwOffCall=thread_call_allocate(pwOffWork,nullptr);
+    sysctl_register_oid(&sysctl__debug_wexpsr_pmc);
     publish();
 }
 }
