@@ -11834,7 +11834,14 @@ void XE::wrapAlderLakeNEngineEnable(void *power) {
 	IOLockLock(c.lock);enableDisplay13EngineLocked(power);IOLockUnlock(c.lock);
 }
 
+bool xePmS2idleActive();
+// With the s2idle sleep of XE-PM armed the display keeps power through system
+// sleep: keep the engine and power banks running (the kept eDP link cannot be
+// retrained on wake); -wex-edp-blank already darkens the panel.
+static volatile uint32_t display13S2idleSkips=0;
 void XE::wrapAlderLakeNEngineDisable(void *power) {
+	if(xePmS2idleActive()){__atomic_add_fetch(&display13S2idleSkips,1,__ATOMIC_RELAXED);
+		uint32_t r[]={1,1,display13S2idleSkips};IORegistryEntry::getRegistryRoot()->setProperty("WEXS2idleDisplay",r,sizeof(r));return;}
     stopDisplay13Engine(power,false);
 }
 
@@ -11960,6 +11967,11 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	if(!enable && callbackXE->display13ShutdownPowerCaller &&
 	   reinterpret_cast<uintptr_t>(__builtin_return_address(0))==callbackXE->display13ShutdownPowerCaller)
 		finishDisplay13TCShutdown(c.controller);
+	if(!enable && xePmS2idleActive()) {
+		__atomic_add_fetch(&display13S2idleSkips,1,__ATOMIC_RELAXED);
+		uint32_t r[]={1,2,display13S2idleSkips};IORegistryEntry::getRegistryRoot()->setProperty("WEXS2idleDisplay",r,sizeof(r));
+		return;
+	}
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)stopDisplay13Engine(power,true);

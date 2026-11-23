@@ -156,9 +156,12 @@ static inline uint16_t xpInw(uint16_t port) { uint16_t v; asm volatile("inw %1, 
 static inline void xpOutw(uint16_t port, uint16_t v) { asm volatile("outw %0, %1" : : "a"(v), "Nd"(port)); }
 static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
 static constexpr unsigned xpGpe0Len = 16;
+static uint8_t gXpGpeEn[16];
+bool xePmS2idleActive() { return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
 static void xpFakeSleep(void *) {
 	uint8_t snap[xpGpe0Len];
-	for (unsigned i = 0; i < xpGpe0Len; i++) snap[i] = xpInb(xpGpe0Sts + i);
+	// Only GPEs the OS armed for wake (GPE0_EN, 0x1870) may end the wait; others (EC chatter) are ignored.
+	for (unsigned i = 0; i < xpGpe0Len; i++) { snap[i] = xpInb(xpGpe0Sts + i); gXpGpeEn[i] = xpInb(xpGpe0Sts + 16 + i); }
 	xpOutw(xpPm1Sts, (1U << 8) | (1U << 10));   // clear PWRBTN_STS and RTC_STS (write 1 to clear)
 	uint32_t reason = 0; uint64_t loops = 0;
 	while (!reason) {
@@ -166,12 +169,13 @@ static void xpFakeSleep(void *) {
 		if (pm1 & (1U << 8)) reason = 1;
 		else if (pm1 & (1U << 10)) reason = 2;
 		else for (unsigned i = 0; i < xpGpe0Len; i++) {
-			const uint8_t g = xpInb(xpGpe0Sts + i), rise = g & ~snap[i];
+			const uint8_t g = xpInb(xpGpe0Sts + i), rise = g & ~snap[i] & gXpGpeEn[i];
 			if (rise) { reason = 0x100 + i * 8 + __builtin_ctz(rise); break; }
 			snap[i] = g;
 		}
 		for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
-		loops++;
+		// Safety net while testing: about two minutes (~0.24 ms per loop measured), then wake.
+		if (++loops >= 500000 && !reason) reason = 3;
 	}
 	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
 	gXpSleepReason = reason; gXpSleepLoops = loops; gXpSleepCount++;
@@ -189,10 +193,12 @@ static int xpSleepHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_re
 	gXpSleepMode = value;
 	return 0;
 }
-static char gXpSleepText[96];
+static char gXpSleepText[160];
 static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
-	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu",
-		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops);
+	char en[40]; size_t u = 0;
+	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
+	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gpe_en=%s",
+		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, en);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
