@@ -8229,6 +8229,35 @@ static int pmcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req)
     return sysctl_handle_string(oidp,pmcText,sizeof(pmcText),req);
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pmc, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC LTR / power gating snapshot");
+// Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
+// write debug.wexpsr.addr, then read or write debug.wexpsr.val.
+static int peekAddr=0x70180;
+static int addrHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=peekAddr;const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<0x40000 || value>0x7FFFC || (value&3))return EINVAL;
+    peekAddr=value;return 0;
+}
+static int valHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    if(!map)return ENODEV;
+    int value=static_cast<int>(rd(static_cast<uint32_t>(peekAddr)));
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    wr(static_cast<uint32_t>(peekAddr),static_cast<uint32_t>(value));return 0;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, addr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, addrHandler, "I", "display register address");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, val, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, valHandler, "I", "display register value");
+// Pipe A colour/plane snapshot, taken when s2idle keeps the display up (pre) and on wake (post).
+static constexpr uint32_t snapRegs[]={0x70180,0x70184,0x70188,0x7018C,0x70190,0x7019C,0x701A4,0x701CC,0x7027C,
+    0x70280,0x70380,0x70030,0x70034,0x6001C,0x4A480,0x49028,0x49010,0x49014,0x49018,0x4901C,0x49020,0x49024,
+    0x49030,0x49034,0x49038,0x49040,0x49044,0x49048,0x49050,0x49054,0x49058,0x4905C,0x49060,0x49064,
+    0x70080,0x70084,0x68180,0x68980,0x70008,0x60400,0x78000,0x78004,0x64000,0x4A400,0x4A404,0x4A408,0x4A410,0x4A414};
+static void snapshot(const char *key) {
+    if(!map)return;
+    uint32_t v[2*sizeof(snapRegs)/sizeof(snapRegs[0])];
+    for(unsigned i=0;i<sizeof(snapRegs)/sizeof(snapRegs[0]);++i){v[2*i]=snapRegs[i];v[2*i+1]=rd(snapRegs[i]);}
+    IORegistryEntry::getRegistryRoot()->setProperty(key,v,sizeof(v));
+}
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
 static void install(IOMemoryMap *m) {
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
@@ -8245,6 +8274,8 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_pw2);
     pwOffCall=thread_call_allocate(pwOffWork,nullptr);
     sysctl_register_oid(&sysctl__debug_wexpsr_pmc);
+    sysctl_register_oid(&sysctl__debug_wexpsr_addr);
+    sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();
 }
 }
@@ -11968,6 +11999,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	   reinterpret_cast<uintptr_t>(__builtin_return_address(0))==callbackXE->display13ShutdownPowerCaller)
 		finishDisplay13TCShutdown(c.controller);
 	if(!enable && xePmS2idleActive()) {
+		WEXPSR::snapshot("WEXS2Pre");
 		__atomic_add_fetch(&display13S2idleSkips,1,__ATOMIC_RELAXED);
 		uint32_t r[]={1,2,display13S2idleSkips};IORegistryEntry::getRegistryRoot()->setProperty("WEXS2idleDisplay",r,sizeof(r));
 		return;
@@ -12176,6 +12208,7 @@ bool XE::prepareDisplay13Wake(IOService *fb) {
 
 void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
     auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
+    if(xePmS2idleActive())WEXPSR::snapshot("WEXS2Post");
     IOLockLock(c.lock);const bool ready=restoreDisplay13ResourcesLocked(power,waking);
     auto controller=static_cast<IOService *>(c.controller);IOLockUnlock(c.lock);
     if(ready)restoreDisplay13Ports(controller);
