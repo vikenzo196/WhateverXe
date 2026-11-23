@@ -170,5 +170,6 @@
   "-wex-reset-nofix": [],
   "-wex-stall-off": [],
   "-wex-tc-mst": [],
-  "-wex-cdclk-stop": []
+  "-wex-cdclk-stop": [],
+  "-wex-cdclk-raise": []
 }

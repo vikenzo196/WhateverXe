@@ -10691,6 +10691,16 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
                     if(before[p].status==Display13WM::Status::Complete)evidence[12]|=1U<<p;
                 }
                 const bool activeReady=active && evidence[12]==active;
+                // The donor asks for the top CDCLK entry once an external output
+                // exists (its HDMI branch). With pipes running and no watermark
+                // certificate for the new clock, keep the running frequency when it
+                // is higher than the request floor of this pipe set instead of
+                // refusing (which faults every later output operation).
+                // -wex-cdclk-raise restores the refusal.
+                if(!activeReady && active && current.status==Display13Clock::Status::Complete &&
+                   nativeHz>current.nativeHz() && !checkKernelArgument("-wex-cdclk-raise")) {
+                    evidence[18]=nativeHz;nativeHz=current.nativeHz();evidence[19]=1;
+                }
                 if(activeReady)for(unsigned p=0;p<3;++p)if(active&(1U<<p))c.pipe[p].watermarkClockHz=0;
                 result=Display13Clock::set(clockIO,nativeHz,{c.bridge.bootAdopted && (active || cold),idle && (cold || activeReady),active},display13ClockVariant());
                 if(cold && result.status==Display13Clock::ChangeStatus::Complete)adlnInvalidateWM();

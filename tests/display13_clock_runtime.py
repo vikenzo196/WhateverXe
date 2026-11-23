@@ -13,7 +13,7 @@ clock=clock.replace('return regs.at(reg);','return regs[reg];')
 clock=clock.replace('assert(reg==Mailbox || reg==Data || reg==Data1 || reg==PLL || reg==Control);','')
 code=(r/'tests/display13_clock_runtime_fixture.cpp').read_text()
 code=code.replace('// DEVICE',clock).replace('// GUARD',s[s.index('struct Display13FBClockGuard {'):s.index('static void adlnInvalidateWM()')])
-code=code.replace('// METHODS',fn('static void adlnSetColdClock(')+'\n'+fn('void XE::adlnSetDualClock('))
+code=code.replace('// METHODS','static bool checkKernelArgument(const char *){return false;}\n'+fn('static void adlnSetColdClock(')+'\n'+fn('void XE::adlnSetDualClock('))
 with tempfile.TemporaryDirectory(prefix='display13-clock-runtime-') as d:
  p=Path(d);(p/'test.cpp').write_text(code)
  subprocess.run(['clang++','-std=c++17','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
