@@ -10730,6 +10730,23 @@ void XE::wrapAlderLakeNClockDisable(IOService *controller) {
 	Display13Clock::Change result;IOLockLock(c.lock);
 	if(callbackXE->display13FBLifecycleHooksReady && controller==c.controller && c.bridge.begun &&
 		!c.bridge.state.faulted && !c.clockFaulted && !Display13WM::busyPipes(c.pipe) && !c.dbuf.updating) {
+		// Adding an external output: the donor stops CDCLK before reprogramming it,
+		// which needs every pipe off. With the kept eDP pipe running, leave the clock
+		// alone and report success; ClockSet then crawls or keeps the frequency with
+		// pipes active. -wex-cdclk-stop restores the refusal.
+		Display13FBPowerIO powerIO {c.map};uint32_t active=0;const auto wells=powerIO.read(Display13Power::Driver);
+		if(wells!=UINT32_MAX)for(unsigned pipe=0;pipe<3;++pipe) if(wells&(1U<<(2*(5+pipe)))) {
+			const auto conf=powerIO.read(0x70008+pipe*0x1000);if(conf!=UINT32_MAX && (conf&(1U<<31)))active|=1U<<pipe;
+		}
+		if(active && !checkKernelArgument("-wex-cdclk-stop")) {
+			Display13FBClockIO io {c.map};const auto current=Display13Clock::read(io,display13ClockVariant());
+			if(current.status==Display13Clock::Status::Complete) {
+				result.status=Display13Clock::ChangeStatus::Complete;result.before=current;result.after=current;
+				uint32_t skip[]={1,active,static_cast<uint32_t>(current.nativeHz()/1000)};
+				IOLockUnlock(c.lock);IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockStopSkipped",skip,sizeof(skip));
+				IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockStop",&result,sizeof(result));return;
+			}
+		}
 		Display13FBClockGuard guard;
 		if(adlnBeginClockGuard(guard)) {
 			Display13FBClockIO io {c.map};result=Display13Clock::stop(io,{true,false,0},display13ClockVariant());

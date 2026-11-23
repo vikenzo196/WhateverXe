@@ -169,5 +169,6 @@
   "-wex-dsi-power-test": [],
   "-wex-reset-nofix": [],
   "-wex-stall-off": [],
-  "-wex-tc-mst": []
+  "-wex-tc-mst": [],
+  "-wex-cdclk-stop": []
 }
