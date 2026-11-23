@@ -24,6 +24,7 @@
 #include "kern_alderlake_n.hpp"
 #include "kern_wex_plane_trace.hpp"
 #include "kern_wex_flip_trace.hpp"
+#include "kern_wex_tc_diag.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
@@ -8138,17 +8139,21 @@ bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
+ const uint32_t before=WEXTCDiag::peek(packet);
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
- if(!ready)return kIOReturnNotReady;
+ if(!ready){WEXTCDiag::recordAUX(2,port,false,false,command,length,before,before,0,kIOReturnNotReady);return kIOReturnNotReady;}
  const auto r=FunctionCast(wrapDisplay13I2CAUX,callbackXE->orgDisplay13I2CAUX)(port,command,packet,length,flag);
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
- return r ? r : complete ? 0 : kIOReturnNotReady;
+ const uint32_t result=r ? r : complete ? 0 : kIOReturnNotReady;
+ WEXTCDiag::recordAUX(2,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result);
+ return result;
 }
 uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
+ const uint32_t before=WEXTCDiag::peek(packet);
  IOLockLock(c.lock);const bool ready=display13AUXReady(port,true);
  const auto ddi=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : 7;
- IOLockUnlock(c.lock);if(!ready)return kIOReturnNotReady;
+ IOLockUnlock(c.lock);if(!ready){WEXTCDiag::recordAUX(1,port,false,false,command,length,before,before,0,kIOReturnNotReady);return kIOReturnNotReady;}
  const auto r=FunctionCast(wrapDisplay13RunAUX,callbackXE->orgDisplay13RunAUX)(port,command,packet,length,flag);
  IOLockLock(c.lock);Display13FBPowerIO io {c.map};const bool held=c.bridge.endAUXCommand(io,ddi);
  // HPD/assignment can disappear while the donor waits for the AUX reply.
@@ -8156,7 +8161,10 @@ uint32_t XE::wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,ui
  const bool protectedCompletion=held && display13AUXReady(port,false,true);
  const bool complete=protectedCompletion && display13AUXReady(port,false);
  if(!protectedCompletion)adlnFault(c.bridge.state.faulted,__LINE__);
- IOLockUnlock(c.lock);return r ? r : complete ? 0 : kIOReturnNotReady;
+ IOLockUnlock(c.lock);
+ const uint32_t result=r ? r : complete ? 0 : kIOReturnNotReady;
+ WEXTCDiag::recordAUX(1,port,true,complete,command,length,before,WEXTCDiag::peek(packet),r,result);
+ return result;
 }
 
 // The donor protocol owns reservation, adoption and pool serialization once.
@@ -9665,6 +9673,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	auto s=callbackXE;auto pci=OSDynamicCast(IOPCIDevice,provider);
 	if(s->tglObservationController==that)s->tglObservationController=nullptr;
 	if(!pci)return false;
+	WEXTCDiag::init();WEXTCDiag::bootEntry(pci,s->display13BootReady);
     const auto board=s->display13BoardWiring(provider);
     if(!Display13FBTopology::supportedWiring(board,s->xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt")) ||
        board.selected()!=s->adlnOutputWiring.selected())return false;
@@ -9688,13 +9697,15 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
  if(!contract.ready())for(uint64_t bit=1;bit;bit<<=1)if(contract.missing()&bit)
   SYSLOG("igfx","Display13 missing operation %s",XELP::DisplayContract::name(bit));
 	that->setProperty("N97FramebufferBackendReady",ready);
+	WEXTCDiag::bootRecord[18]=(ready?1U:0U)|(contract.ready()?2U:0U)|(s->display13BootReady?4U:0U)|(s->tglActive?8U:0U);
+	WEXTCDiag::bootStep(ready?2:0x102);
 	if(!ready)return false;
 	const bool dualReady=s->display13BootReady && s->adlnScanoutDisableFB && s->orgAlderLakeNSysMemAllocate && s->orgAlderLakeNSysMemFree &&
 		(!adlnFixedSysMemEnabled || display13FBSysMem.lock) && display13FBSysMem.retireLock && s->adlnWorkLoopInGate && s->adlnWorkLoopTryClose && s->adlnWorkLoopOpen;
 	uint64_t dualPolicy[] {1,s->adlnOutputWiring.selected(),dualReady,s->display13BootReady,s->adlnScanoutDisableFB!=0,
 		s->orgAlderLakeNSysMemAllocate!=0,s->orgAlderLakeNSysMemFree!=0,display13FBSysMem.lock!=nullptr,display13FBSysMem.retireLock!=nullptr,adlnFixedSysMemEnabled};
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferDualPolicy",dualPolicy,sizeof(dualPolicy));
-	if(Display13FBTopology::multiOutputWiring(s->adlnOutputWiring) && !dualReady)return false;
+	if(Display13FBTopology::multiOutputWiring(s->adlnOutputWiring) && !dualReady){WEXTCDiag::bootStep(0x103);return false;}
 	// Native provider-workloop mode creates/binds the PCI interrupt source in
 	// controller start, rather than waiting for an accelerator or FB open.
 	// This backend supports linear boot surfaces and Y-tiled native scanout,
@@ -9711,14 +9722,16 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 		that->setProperty("FeatureControl",features) &&
 		(provider->getProperty("AAPL,GfxYTile") || provider->setProperty("AAPL,GfxYTile",&enabled,sizeof(enabled)));
 	OSSafeReleaseNULL(yTiling);OSSafeReleaseNULL(mode);OSSafeReleaseNULL(features);
-	if(!featuresSelected)return false;
-    if(Display13FBTopology::deferredBootPrepare(board,s->adlpDisplaySelected) && !s->prepareDisplay13BootScanout(pci))return false;
+	if(!featuresSelected){WEXTCDiag::bootStep(0x104);return false;}
+    if(Display13FBTopology::deferredBootPrepare(board,s->adlpDisplaySelected) && !s->prepareDisplay13BootScanout(pci)){WEXTCDiag::bootStep(0x105);return false;}
+	WEXTCDiag::bootStep(4);
 	SYSLOG("igfx","Display13 native controller start enter offline=%u",display13Offline);
 	if(!checkKernelArgument("-wex-noplanetrace"))WEXPlaneTrace::start(pci,!checkKernelArgument("-wex-noplaneguard"));
 	const auto started=FunctionCast(wrapDisplay13FramebufferStart,s->orgFramebufferStart)(that,provider);
 	WEXPlaneTrace::started();
 	if(!checkKernelArgument("-wex-noshutguard"))WEXPlaneTrace::armShutdown();
 	if(!checkKernelArgument("-wex-noflipsysctl"))WEXFlipTrace::install(WEXPlaneTrace::map);
+	WEXTCDiag::install(WEXPlaneTrace::map);WEXTCDiag::bootStep(started?5:0x105+0x100);
 	SYSLOG("igfx","Display13 native controller start return=%u",started);
 	that->setProperty("N97FramebufferOriginalStart",started);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferOriginalStart",started);

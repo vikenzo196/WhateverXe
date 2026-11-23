@@ -52,6 +52,7 @@ struct Handoff {
 } handoff;
 namespace WEXPlaneTrace {inline void start(IOService *,bool){} inline void started(){} inline void armShutdown(){} inline void *map=nullptr;}
 namespace WEXFlipTrace {inline void install(void *){}}
+namespace WEXTCDiag {inline uint32_t bootRecord[19];inline void init(){} inline void bootEntry(void *,bool){} inline void bootStep(uint32_t){} inline void install(void *){}}
 static bool checkKernelArgument(const char *){return false;}
 bool prepare(IOService *that,IOService *provider){
  auto s=&handoff;auto pci=provider;
