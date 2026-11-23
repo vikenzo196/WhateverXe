@@ -9454,6 +9454,8 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
  }
  return handled;
 }
+static IOService *display13EDPBlankedFB=nullptr;
+bool xePmS2idleActive();
 bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &result) {
  namespace B=Display13EDPBlank;
  if(!display13EDPBlankActive)return false;
@@ -9466,13 +9468,16 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
   current=Display13FBMemory::field<uint32_t>(fb,0x4284);
   eligible=mapped && display13EDPKeepKept && c.bootPanel && c.bridge.bootAdopted &&
    Display13FBMemory::field<void *>(fb,0x1D0)==c.controller && Display13FBMemory::boundPipe(c.pipe,fb)==0;
+  // During an s2idle system sleep the donor may release FB0's scanout binding
+  // while the panel is blanked; the framebuffer we blanked stays ours to wake.
+  if(!eligible && mapped && b.blanked && fb==display13EDPBlankedFB && xePmS2idleActive())eligible=true;
   action=mapped ? B::decide(eligible,current,state,b.blanked) : B::Action::Native;
   struct IO {
    uintptr_t base;
    uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {base};
-  if(action==B::Action::Blank)B::blank(io,b);
+  if(action==B::Action::Blank){B::blank(io,b);display13EDPBlankedFB=fb;}
   else if(action==B::Action::Unblank)B::unblank(io,b);
   if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
   IOLockUnlock(c.lock);
