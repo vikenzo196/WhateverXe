@@ -25,6 +25,7 @@
 #include "kern_wex_plane_trace.hpp"
 #include "kern_wex_flip_trace.hpp"
 #include "kern_wex_tc_diag.hpp"
+#include "kern_wex_dmc_adlp.hpp"
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
 #include "kern_xelp_forcewake_irq.hpp"
@@ -8077,12 +8078,79 @@ SYSCTL_PROC(_debug_wexpsr, OID_AUTO, status, CTLTYPE_STRING|CTLFLAG_RD, nullptr,
 static inline uint64_t rdmsr64(uint32_t m){uint32_t lo,hi;asm volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(m));return (uint64_t(hi)<<32)|lo;}
 static char pmText[256];
 static int pmHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
-    if(map)snprintf(pmText,sizeof(pmText),"msrE2=%llx msr1FC=%llx dcStateEn=%08x dmc80000=%08x ssp=%08x htp=%08x rc6=%u rcState=%08x",
-        rdmsr64(0xE2),rdmsr64(0x1FC),rd(0x45504),rd(0x80000),rd(0x8F074),rd(0x8F004),rd(0x138108),rd(0x138104));
+    if(map)snprintf(pmText,sizeof(pmText),"msrE2=%llx msr1FC=%llx dcStateEn=%08x dmc80000=%08x ssp=%08x htp=%08x rc6=%u rcState=%08x dc5=%u dc6=%u pwr=%08x",
+        rdmsr64(0xE2),rdmsr64(0x1FC),rd(0x45504),rd(0x80000),rd(0x8F074),rd(0x8F004),rd(0x138108),rd(0x138104),rd(0x101084),rd(0x101088),rd(0x45404));
     else snprintf(pmText,sizeof(pmText),"unavailable");
     return sysctl_handle_string(oidp,pmText,sizeof(pmText),req);
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pm, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, pmHandler, "A", "package power diagnostics");
+// ---- DMC (display microcontroller) experiment, runtime only ----
+// debug.wexpsr.dmc=1 loads the main ADL-P DMC program (linux-firmware
+// adlp_dmc.bin, generic stepping entry) like Linux intel_dmc_load_program:
+// disable the 8 main event handlers, write the program at 0x80000, write the
+// header MMIO pairs, then set DC_STATE_DEBUG mask bits. Pipe DMCs are not loaded.
+// debug.wexpsr.dc=N allows DC5 for N seconds (DC_STATE_EN bit0), then clears it;
+// 0 clears it now. DC6 is not requested.
+constexpr uint32_t DCStateEn=0x45504,DCStateDebug=0x45520,DC5Count=0x101084,DC6Count=0x101088;
+static bool dmcLoaded=false;
+static thread_call_t dcOffCall=nullptr;
+static int dcRequested=0;
+static uint32_t dmcResult=0;
+static void writeDCState(uint32_t state) {
+    wr(DCStateEn,state);
+    unsigned rewrites=0,rereads=0;
+    while(rewrites<100) {
+        const uint32_t v=rd(DCStateEn);
+        if(v!=state){wr(DCStateEn,state);++rewrites;rereads=0;}
+        else if(rereads++>5)break;
+    }
+}
+static int dmcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=dmcLoaded?1:0;
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=1)return EINVAL;
+    if(!map || !lock)return ENODEV;
+    IOLockLock(lock);
+    if(!dmcLoaded) {
+        for(unsigned h=0;h<8;++h){wr(0x8F034+4*h,(3U<<16)|(1U<<8));wr(0x8F004+4*h,0);}
+        for(uint32_t i=0;i<WEXDMCADLP::words;++i)wr(WEXDMCADLP::start+4*i,WEXDMCADLP::payload[i]);
+        for(uint32_t i=0;i<WEXDMCADLP::count;++i)wr(WEXDMCADLP::mmioAddr[i],WEXDMCADLP::mmioData[i]);
+        wr(DCStateDebug,rd(DCStateDebug)|3U);
+        // Readback: program word 0 and the SSP/HTP pair Linux checks.
+        dmcResult=(rd(WEXDMCADLP::start)==WEXDMCADLP::payload[0]?1U:0U)|(rd(0x8F074)?2U:0U)|(rd(0x8F004)?4U:0U);
+        dmcLoaded=dmcResult==7;
+    }
+    IOLockUnlock(lock);
+    uint32_t r[]={1,dmcResult,WEXDMCADLP::fwVersion,rd(0x8F074),rd(0x8F004),rd(DCStateDebug)};
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXDMC",r,sizeof(r));
+    return dmcLoaded?0:EIO;
+}
+static void dcOffWork(thread_call_param_t,thread_call_param_t) {
+    if(!lock)return;IOLockLock(lock);writeDCState(0);dcRequested=0;IOLockUnlock(lock);
+}
+static int dcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=dcRequested;
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<0 || value>600)return EINVAL;
+    if(!map || !lock || !dcOffCall)return ENODEV;
+    IOLockLock(lock);
+    thread_call_cancel(dcOffCall);
+    int result=0;
+    if(!value){writeDCState(0);dcRequested=0;}
+    else if(!dmcLoaded)result=ENXIO;
+    else {
+        writeDCState(1U); // DC_STATE_EN_UPTO_DC5
+        dcRequested=value;
+        uint64_t deadline=0;clock_interval_to_deadline(static_cast<uint32_t>(value),kSecondScale,&deadline);
+        thread_call_enter_delayed(dcOffCall,deadline);
+    }
+    IOLockUnlock(lock);
+    return result;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dmc, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dmcHandler, "I", "1 loads the ADL-P main DMC");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dc, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dcHandler, "I", "seconds of DC5 allowed");
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
 static void install(IOMemoryMap *m) {
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
@@ -8093,6 +8161,9 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_enable);
     sysctl_register_oid(&sysctl__debug_wexpsr_status);
     sysctl_register_oid(&sysctl__debug_wexpsr_pm);
+    sysctl_register_oid(&sysctl__debug_wexpsr_dmc);
+    sysctl_register_oid(&sysctl__debug_wexpsr_dc);
+    dcOffCall=thread_call_allocate(dcOffWork,nullptr);
     publish();
 }
 }
