@@ -66,6 +66,40 @@ inline bool serializeAUX(void *,void *,OSSerialize *serializer) {
     const bool ok=data->serialize(serializer);data->release();return ok;
 }
 
+
+// Hook results on the training path (external ports only).
+struct HookEntry {uint32_t seq,us;uint8_t id,ddi,pad0,pad1;uint32_t result,arg,byte115_117_10_11A;};
+static constexpr unsigned HookMax=512;
+inline HookEntry hooks[HookMax];
+inline volatile uint32_t hookSeq;
+
+inline void recordHook(uint8_t id,void *object,uint32_t result,uint32_t arg,uint32_t isPath) {
+    if(!enabled || !object)return;
+    auto o=static_cast<OSObject *>(object);
+    if(o->getMetaClass()->getClassSize()<(isPath?0x3730U:0x624U))return;
+    auto p=static_cast<const uint8_t *>(object);
+    if(isPath) {
+        auto port=*reinterpret_cast<OSObject * const *>(p+0x3648);
+        if(!port || port->getMetaClass()->getClassSize()<0x624U)return;
+        p=reinterpret_cast<const uint8_t *>(port);
+    }
+    const uint32_t ddi=*reinterpret_cast<const uint32_t *>(p+0x120);
+    if(ddi==0 || ddi>8)return;
+    const uint32_t flags=p[0x115]|(p[0x117]<<8)|(p[0x10]<<16)|(static_cast<uint32_t>(p[0x11A])<<24);
+    const uint32_t n=__atomic_add_fetch(&hookSeq,1,__ATOMIC_ACQ_REL);
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    hooks[(n-1)%HookMax]={n,static_cast<uint32_t>(ns/1000),id,static_cast<uint8_t>(ddi),0,0,result,arg,flags};
+}
+
+inline bool serializeHooks(void *,void *,OSSerialize *serializer) {
+    const uint32_t n=__atomic_load_n(&hookSeq,__ATOMIC_ACQUIRE);
+    const uint32_t first=n>HookMax ? n-HookMax : 0;
+    auto data=OSData::withCapacity(static_cast<unsigned int>((n-first)*sizeof(HookEntry)));
+    if(!data)return false;
+    for(uint32_t i=first;i<n;++i)data->appendBytes(&hooks[i%HookMax],sizeof(HookEntry));
+    const bool ok=data->serialize(serializer);data->release();return ok;
+}
+
 // Registers: HPD (north TC bank), TC hotplug control, FIA1/FIA2 lane and mode
 // state, DDI_BUF_CTL A..I, AUX_CH_CTL A..I, TRANS_DDI_FUNC_CTL A..D,
 // TRANSCONF A..D, power well request/status.
@@ -149,6 +183,7 @@ inline void install(IOMemoryMap *map) {
     auto root=IORegistryEntry::getRegistryRoot();
     if(auto s=OSSerializer::forTarget(nullptr,serializeAUX)){root->setProperty("WEXAUXTrace",s);s->release();}
     if(auto s=OSSerializer::forTarget(nullptr,serializeRegs)){root->setProperty("WEXTCRegs",s);s->release();}
+    if(auto s=OSSerializer::forTarget(nullptr,serializeHooks)){root->setProperty("WEXTCHooks",s);s->release();}
 }
 
 }

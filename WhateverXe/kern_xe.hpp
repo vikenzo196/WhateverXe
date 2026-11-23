@@ -220,6 +220,7 @@ private:
  mach_vm_address_t orgDisplay13EnablePort {},orgDisplay13DisablePort {};
  static bool display13MainLinkAUX(void *port,bool acquire,bool stopping=false);
  static uint32_t wrapDisplay13EnablePort(void *port);
+ static uint32_t diagDisplay13EnablePort(void *port);
  static uint32_t wrapDisplay13DisablePort(void *port);
  bool processDisplay13FramebufferSST(KernelPatcher &,size_t,mach_vm_address_t,size_t);
  bool display13TrainingReady {},display13FramingReady {},display13ClockOrderReady {};
@@ -230,6 +231,7 @@ private:
  static bool display13LeaseStop(void *controller,void *port);
  static bool display13TrainingPath(void *path,uint32_t &ddi,uint32_t &pipe);
  static uint32_t wrapDisplay13PortTraining(void *port,void *request);
+ static uint32_t diagDisplay13PortTraining(void *port,void *request);
  static bool display13StopTranscoder(void *port);
  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
 
@@ -237,8 +239,10 @@ private:
  static uint8_t *display13PanelBootPort(void *port);
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
+ static uint32_t diagDisplay13TrainingPattern(void *path,uint32_t pattern);
  static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);
  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
+ static uint32_t diagDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
 	mach_vm_address_t xelpProviderProbe {},xelpProviderConfigureProbe {};
  bool display13DPAltProbeReady {},display13DPProbeReady {},display13TCProbeReady {},display13TCDPProbeReady {},display13FBDPHooksReady {};
  bool adlpDisplaySelected {};
@@ -405,6 +409,7 @@ private:
     static uint32_t wrapDisplay13DPLightUp(void *,void *,void *,const void *);
  static void wrapDisplay13DPPhyGating(void *,bool);
  static uint32_t wrapDisplay13DPLaneMask(void *);
+ static uint32_t diagDisplay13DPLaneMask(void *port);
  static void wrapDisplay13DPPortWrite(void *,uint32_t,uint32_t);
  mach_vm_address_t orgDisplay13DPLightUp {},display13DPTraining {},display13DPSDPs {};
  mach_vm_address_t orgDisplay13DPPhyGating {},orgDisplay13DPLaneMask {},orgDisplay13DPPortWrite {},display13DPImage {};

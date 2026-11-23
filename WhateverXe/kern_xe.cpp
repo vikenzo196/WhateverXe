@@ -7728,7 +7728,7 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
         {entries[SetMode].symbol,wrapDisplay13TCSetMode,orgDisplay13TCSetMode},
         {entries[DPLightUp].symbol,wrapDisplay13DPLightUp,orgDisplay13DPLightUp},
         {entries[PhyGating].symbol,wrapDisplay13DPPhyGating,orgDisplay13DPPhyGating},
-        {entries[LaneMask].symbol,wrapDisplay13DPLaneMask,orgDisplay13DPLaneMask},
+        {entries[LaneMask].symbol,diagDisplay13DPLaneMask,orgDisplay13DPLaneMask},
         {entries[PortWrite].symbol,wrapDisplay13DPPortWrite,orgDisplay13DPPortWrite}
     };
     // Signal is already routed by the common SST frontend; its wrapper
@@ -8211,7 +8211,7 @@ bool XE::processDisplay13Training(KernelPatcher &patcher,size_t index,mach_vm_ad
  const auto &e=entries[PortTrain];
  const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,e.symbol,address,size);patcher.clearError();
  if(fn!=address+e.offset || memcmp(reinterpret_cast<void *>(fn),e.prefix,sizeof(e.prefix)))return false;
- KernelPatcher::RouteRequest route(e.symbol,wrapDisplay13PortTraining,orgDisplay13PortTraining);
+ KernelPatcher::RouteRequest route(e.symbol,diagDisplay13PortTraining,orgDisplay13PortTraining);
  const bool routed=patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
  if(!routed)return false;
  trainingLeaseDP13Mask=adlnOutputWiring.links();
@@ -8286,6 +8286,33 @@ bool XE::display13TrainingPath(void *path,uint32_t &ddi,uint32_t &pipe) {
  }
  IORecursiveLockUnlock(s->tglPathPoolLock);return found;
 }
+// Type-C diagnostics: route-level recorders around the training hooks.
+uint32_t XE::diagDisplay13PortTraining(void *port,void *request) {
+ const auto result=wrapDisplay13PortTraining(port,request);
+ WEXTCDiag::recordHook(1,port,result,0,0);
+ return result;
+}
+uint32_t XE::diagDisplay13EnablePort(void *port) {
+ const auto result=wrapDisplay13EnablePort(port);
+ WEXTCDiag::recordHook(2,port,result,0,0);
+ return result;
+}
+uint32_t XE::diagDisplay13TrainingPattern(void *path,uint32_t pattern) {
+ const auto result=wrapDisplay13TrainingPattern(path,pattern);
+ WEXTCDiag::recordHook(3,path,result,pattern,1);
+ return result;
+}
+uint32_t XE::diagDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig) {
+ const auto result=wrapDisplay13SignalLevels(port,swing,emphasis,overrideConfig);
+ WEXTCDiag::recordHook(4,port,result,(swing<<8)|emphasis,0);
+ return result;
+}
+uint32_t XE::diagDisplay13DPLaneMask(void *port) {
+ const auto result=wrapDisplay13DPLaneMask(port);
+ WEXTCDiag::recordHook(5,port,result,0,0);
+ return result;
+}
+
 uint32_t XE::wrapDisplay13PortTraining(void *port,void *request) {
  auto s=callbackXE;auto &c=display13FBPower;
  if(!s->display13FramingReady || display13HDMIPort(port))
@@ -8378,9 +8405,9 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
     memcmp(reinterpret_cast<void *>(address+0x61468),lanesABI,sizeof(lanesABI)) ||
     memcmp(reinterpret_cast<void *>(address+0x61478),successABI,sizeof(successABI)))return false;
  KernelPatcher::RouteRequest routes[] {
-  {pattern,wrapDisplay13TrainingPattern,orgDisplay13TrainingPattern},
-  {signal,wrapDisplay13SignalLevels,orgDisplay13SignalLevels},
-  {enable,wrapDisplay13EnablePort,orgDisplay13EnablePort},
+  {pattern,diagDisplay13TrainingPattern,orgDisplay13TrainingPattern},
+  {signal,diagDisplay13SignalLevels,orgDisplay13SignalLevels},
+  {enable,diagDisplay13EnablePort,orgDisplay13EnablePort},
   {disable,wrapDisplay13DisablePort,orgDisplay13DisablePort}
  };
  display13FBSSTHooksReady=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
