@@ -8070,6 +8070,19 @@ static int statusHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
 SYSCTL_NODE(_debug, OID_AUTO, wexpsr, CTLFLAG_RW, 0, "WhateverXe eDP PSR1 experiment");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, enable, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, enableHandler, "I", "seconds (-1 on, 0 off)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, status, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, statusHandler, "A", "PSR registers");
+// Read-only package power diagnostics: MSR_PKG_CST_CONFIG_CONTROL (0xE2, package
+// C-state limit in bits 3:0), MSR_POWER_CTL (0x1FC), DC_STATE_EN (0x45504),
+// DMC program/SSP/HTP words (0x80000, 0x8F074, 0x8F004: zero = no DMC loaded),
+// GT RC6 residency (0x138108) and RC state (0x138104).
+static inline uint64_t rdmsr64(uint32_t m){uint32_t lo,hi;asm volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(m));return (uint64_t(hi)<<32)|lo;}
+static char pmText[256];
+static int pmHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    if(map)snprintf(pmText,sizeof(pmText),"msrE2=%llx msr1FC=%llx dcStateEn=%08x dmc80000=%08x ssp=%08x htp=%08x rc6=%u rcState=%08x",
+        rdmsr64(0xE2),rdmsr64(0x1FC),rd(0x45504),rd(0x80000),rd(0x8F074),rd(0x8F004),rd(0x138108),rd(0x138104));
+    else snprintf(pmText,sizeof(pmText),"unavailable");
+    return sysctl_handle_string(oidp,pmText,sizeof(pmText),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pm, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, pmHandler, "A", "package power diagnostics");
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
 static void install(IOMemoryMap *m) {
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
@@ -8079,6 +8092,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr);
     sysctl_register_oid(&sysctl__debug_wexpsr_enable);
     sysctl_register_oid(&sysctl__debug_wexpsr_status);
+    sysctl_register_oid(&sysctl__debug_wexpsr_pm);
     publish();
 }
 }
