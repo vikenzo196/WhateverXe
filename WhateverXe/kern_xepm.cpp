@@ -267,7 +267,10 @@ static void xpUserWakeWork(thread_call_param_t, thread_call_param_t) {
 static IOReturn xpSleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
 	if ((type == kIOMessageSystemCapabilityChange || type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) &&
 	    gXpUserWakeCall && __atomic_exchange_n(&gXpUserWakePending, false, __ATOMIC_ACQ_REL)) {
-		uint64_t deadline; clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+		// Late enough for the dark wake's framebuffer Doze transitions (FB0 held at Sleep while the first
+		// native FB restores the saved display controller): a full wake requested at once sends every FB
+		// from Sleep straight to Wake and that restore is skipped.
+		uint64_t deadline; clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
 		thread_call_enter_delayed(gXpUserWakeCall, deadline);
 	}
 	if (type == kIOMessageSystemWillSleep && xePmS2idleActive()) __atomic_store_n(&gXpSystemSleeping, true, __ATOMIC_RELEASE);

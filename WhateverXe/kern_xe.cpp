@@ -9648,7 +9648,8 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
     auto &c=display13FBPower;
     r[18]=c.map && c.map->getVirtualAddress() ? *reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+0x44200) : UINT32_MAX;
     r[19]=UINT32_MAX;
-    if(r[18]==0)if(auto controller=Display13FBMemory::field<IOService *>(fb,0x1D0))r[19]=wrapDisplay13FBEnableIRQ(controller);
+    // Master enable is bit 31; a pending-event bit (e.g. 0x10000) can be set while it is off.
+    if(r[18]!=UINT32_MAX && !(r[18]&0x80000000U))if(auto controller=Display13FBMemory::field<IOService *>(fb,0x1D0))r[19]=wrapDisplay13FBEnableIRQ(controller);
     r[5]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOn,nullptr);
     r[6]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOn,nullptr);
     r[13]=Display13FBMemory::field<uint32_t>(fb,0x4004);
