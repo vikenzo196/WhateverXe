@@ -157,6 +157,14 @@ static inline void xpOutw(uint16_t port, uint16_t v) { asm volatile("outw %0, %1
 static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
 static constexpr unsigned xpGpe0Len = 16;
 static uint8_t gXpGpeEn[16];
+// The render engine (GT) keeps its state through an s2idle sleep, but the
+// accelerator's sleep/wake path expects the cold GT of a real S3 resume. Before
+// returning, reset the GT domains like a power cycle would (GEN6_GDRST 0x941C,
+// GRDOM_FULL; not in the GT power well, no forcewake needed - Linux
+// gen6_hw_domain_reset). The display engine is not part of this reset.
+static volatile uint8_t *gXpGpuMmio = nullptr;
+static uint32_t gXpGdrst = 0;
+void xePmSetGpuMmio(volatile uint8_t *mmio) { gXpGpuMmio = mmio; }
 bool xePmS2idleActive() { return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
 uint32_t xePmS2idleSleeps() { return __atomic_load_n(&gXpSleepCount, __ATOMIC_ACQUIRE); }
 static void xpFakeSleep(void *) {
@@ -179,6 +187,13 @@ static void xpFakeSleep(void *) {
 		if (++loops >= 500000 && !reason) reason = 3;
 	}
 	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
+	if (gXpGpuMmio) {
+		auto gdrst = reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + 0x941C);
+		*gdrst = 1U;   // GRDOM_FULL
+		uint32_t spins = 0;
+		while ((*gdrst & 1U) && spins < 2000) { for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause(); spins++; }
+		gXpGdrst = (*gdrst & 1U) ? 0x80000000U | spins : spins + 1;
+	}
 	gXpSleepReason = reason; gXpSleepLoops = loops; gXpSleepCount++;
 }
 static void xpAcpiSleepKernel(xpAcpiSleepCallback func, void *refcon) {
@@ -198,8 +213,8 @@ static char gXpSleepText[160];
 static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[40]; size_t u = 0;
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
-	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gpe_en=%s",
-		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, en);
+	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s",
+		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");

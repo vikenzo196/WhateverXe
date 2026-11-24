@@ -8039,6 +8039,7 @@ static uint16_t display13EDPAuxBLMax=0;
 // disable clears the enable bit, waits for the IDLE state, then clears 0x170.
 // Display 12+ Linux keeps link standby off: the main link turns off in PSR and
 // the source retrains it with TPS1/TPS3 on exit (2500 us each, the safest timing).
+void xePmSetGpuMmio(volatile uint8_t *mmio);
 namespace WEXPSR {
 constexpr uint32_t Ctl=0x60800,Status=0x60840,Perf=0x60844,Debug=0x60860;
 constexpr uint32_t Enable=1U<<31,KeepCtx=1U<<29,CRC=1U<<10,TP1TP3=1U<<11;
@@ -8261,6 +8262,7 @@ static void snapshot(const char *key) {
 }
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
 static void install(IOMemoryMap *m) {
+    if(m)xePmSetGpuMmio(reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress()));
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
     lock=IOLockAlloc();offCall=thread_call_allocate(offWork,nullptr);
     if(!lock || !offCall)return;
