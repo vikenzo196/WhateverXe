@@ -212,6 +212,26 @@ static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
 static int gXpSleepWait = 1, gXpSleepSafety = 0;
 static uint64_t gXpTscPerMs = 0, gXpSleepMs = 0, gXpSleepPkgMw = 0, gXpSleepCoreMw = 0, gXpSleepHwp = 0;
 static int gXpWaitPkg = -1;
+// Measurement around the wait (read only): package C-state residency (PC2..PC10, per mille of the wait),
+// graphics (PP1) and platform (PSYS) energy, the package C-state limit, GT RC6 residency and the display
+// pipe/plane/DC state when the wait starts. The MSRs are probed with rdmsr_carefully (no #GP on a missing
+// MSR) when s2idle is armed; the wait reads only those that answered.
+static mach_vm_address_t gXpRdmsrCarefully = 0;
+static constexpr uint32_t xpResMsr[7] = {0x60D, 0x3F8, 0x3F9, 0x3FA, 0x630, 0x631, 0x632};   // PC2 PC3 PC6 PC7 PC8 PC9 PC10
+static uint32_t gXpMsrOk = 0;   // bits 0-6 xpResMsr, 8 PP1 0x641, 9 PSYS 0x64D, 10 PKG_CST_CONFIG 0xE2, 31 probed
+static uint32_t gXpResPm[7];
+static uint64_t gXpPp1Mw = 0, gXpPsysMw = 0, gXpPkgCst = 0;
+static uint32_t gXpRc6 = 0, gXpGtCore[2], gXpDisp[5];   // RC6 counter delta; GT core status start/end; display regs
+static void xpProbeMsrs() {
+	if (!gXpRdmsrCarefully || (gXpMsrOk & 0x80000000U)) return;
+	auto rd = reinterpret_cast<int (*)(uint32_t, uint32_t *, uint32_t *)>(gXpRdmsrCarefully);
+	uint32_t lo = 0, hi = 0, ok = 0x80000000U;
+	for (unsigned i = 0; i < 7; i++) if (rd(xpResMsr[i], &lo, &hi) == 0) ok |= 1U << i;
+	if (rd(0x641, &lo, &hi) == 0) ok |= 1U << 8;
+	if (rd(0x64D, &lo, &hi) == 0) ok |= 1U << 9;
+	if (rd(0xE2, &lo, &hi) == 0) { ok |= 1U << 10; gXpPkgCst = ((uint64_t)hi << 32) | lo; }
+	gXpMsrOk = ok;
+}
 static inline uint64_t xpRdtsc() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
 // TPAUSE ecx: bit 0 = 0 selects C0.2; ends at the EDX:EAX TSC deadline (or on an external event).
 static inline void xpTpause(uint64_t deadline) {
@@ -219,6 +239,7 @@ static inline void xpTpause(uint64_t deadline) {
 }
 static void xpCalibrate() {
 	xpFindEcGpe();
+	xpProbeMsrs();
 	if (gXpWaitPkg < 0) {
 		uint32_t a = 7, b, c = 0, d;
 		asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
@@ -288,6 +309,22 @@ static void xpFakeSleep(void *) {
 	const uint64_t tpms = gXpTscPerMs, t0 = xpRdtsc();
 	const uint64_t safety = gXpSleepSafety > 0 && tpms ? (uint64_t)gXpSleepSafety * 1000ULL * tpms : 0;
 	const uint64_t e0 = xpRdmsr(0x611) & 0xFFFFFFFFULL, c0 = xpRdmsr(0x639) & 0xFFFFFFFFULL;
+	const uint32_t mok = gXpMsrOk;
+	uint64_t r0[7] = {}, g0 = 0, p0 = 0;
+	for (unsigned i = 0; i < 7; i++) if (mok & (1U << i)) r0[i] = xpRdmsr(xpResMsr[i]);
+	if (mok & (1U << 8)) g0 = xpRdmsr(0x641) & 0xFFFFFFFFULL;
+	if (mok & (1U << 9)) p0 = xpRdmsr(0x64D) & 0xFFFFFFFFULL;
+	uint32_t rc0 = 0;
+	if (gXpGpuMmio) {
+		auto mm = [](uint32_t r) { return *reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + r); };
+		rc0 = mm(0x138108);          // GEN6_GT_GFX_RC6 residency
+		gXpGtCore[0] = mm(0x138060); // GEN6_GT_CORE_STATUS
+		gXpDisp[0] = mm(0x70008);    // TRANSCONF A
+		gXpDisp[1] = mm(0x70180);    // PLANE_CTL_1_A
+		gXpDisp[2] = mm(0x45504);    // DC_STATE_EN
+		gXpDisp[3] = mm(0x45404);    // PWR_WELL_CTL2 (driver requests)
+		gXpDisp[4] = mm(0x70030);    // PIPE_MISC A
+	}
 	uint64_t hwp = 0; bool hwpSet = false;
 	if (wait >= 1 && (xpRdmsr(0x770) & 1)) {
 		hwp = xpRdmsr(0x774);
@@ -334,6 +371,14 @@ static void xpFakeSleep(void *) {
 		// mW = (counts / 2^esu J) / (ms / 1000 s) * 1000
 		gXpSleepPkgMw = ms ? (((e1 - e0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
 		gXpSleepCoreMw = ms ? (((c1 - c0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
+		const uint64_t dt = t1 - t0;
+		for (unsigned i = 0; i < 7; i++) gXpResPm[i] = (mok & (1U << i)) && dt ? (uint32_t)((xpRdmsr(xpResMsr[i]) - r0[i]) * 1000ULL / dt) : 0;
+		gXpPp1Mw = (mok & (1U << 8)) && ms ? ((((xpRdmsr(0x641) & 0xFFFFFFFFULL) - g0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
+		gXpPsysMw = (mok & (1U << 9)) && ms ? ((((xpRdmsr(0x64D) & 0xFFFFFFFFULL) - p0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
+		if (gXpGpuMmio) {
+			gXpRc6 = *reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + 0x138108) - rc0;
+			gXpGtCore[1] = *reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + 0x138060);
+		}
 	}
 	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
 	if (gXpGpuMmio) {
@@ -384,16 +429,21 @@ static int xpSleepSafetyHandler(struct sysctl_oid *oidp, void *, int, struct sys
 	gXpSleepSafety = value;
 	return 0;
 }
-static char gXpSleepText[320];
+static char gXpSleepText[720];
 static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[40]; size_t u = 0;
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
 	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s"
 		" wait=%d waitpkg=%d safety=%d tsc_ms=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx"
-		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u",
+		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u"
+		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u pp1_mw=%llu psys_mw=%llu pkgcst=0x%llx msrok=0x%x"
+		" rc6=%u gtcore=0x%x/0x%x trans=0x%x plane=0x%x dc=0x%x pwell=0x%x pipemisc=0x%x",
 		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
 		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp,
-		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3], gXpUserWakeCount);
+		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3], gXpUserWakeCount,
+		gXpResPm[0], gXpResPm[1], gXpResPm[2], gXpResPm[3], gXpResPm[4], gXpResPm[5], gXpResPm[6],
+		gXpPp1Mw, gXpPsysMw, gXpPkgCst, gXpMsrOk,
+		gXpRc6, gXpGtCore[0], gXpGtCore[1], gXpDisp[0], gXpDisp[1], gXpDisp[2], gXpDisp[3], gXpDisp[4]);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
@@ -452,6 +502,8 @@ void xePmInstall(KernelPatcher &patcher) {
 			gXpRequestUserActive = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN14IOPMrootDomain17requestUserActiveEP9IOServicePKc");
 			patcher.clearError();
 			gXpUserWakeCall = gXpRequestUserActive ? thread_call_allocate(xpUserWakeWork, nullptr) : nullptr;
+			gXpRdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
+			patcher.clearError();
 			registerPrioritySleepWakeInterest(xpSleepInterest, nullptr, nullptr);
 		}
 		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
