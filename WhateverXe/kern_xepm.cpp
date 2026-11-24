@@ -157,6 +157,34 @@ static inline uint8_t xpInb(uint16_t port) { uint8_t v; asm volatile("inb %1, %0
 static inline uint16_t xpInw(uint16_t port) { uint16_t v; asm volatile("inw %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline void xpOutw(uint16_t port, uint16_t v) { asm volatile("outw %0, %1" : : "a"(v), "Nd"(port)); }
 static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
+// Wait inside the sleep callback. XNU has already turned the other CPUs off and shut this CPU's
+// local APIC down (acpi_sleep_kernel: pmCPUExitHaltToOff, lapic_shutdown), so no interrupt can end
+// an MWAIT here: the wake sources are polled. s2wait 1 (default): the core's HWP ceiling is set to
+// its floor for the wait (the request is restored exactly; EPP untouched) and each poll slice is a
+// timed TPAUSE (C0.2, WAITPKG) when the CPU has it; s2wait 0: the original PAUSE spin.
+// s2safety: seconds after which the wait ends by itself (0 = never; the test script sets it).
+// The package energy counter (RAPL) is read around the wait: s2stat reports the average power.
+static int gXpSleepWait = 1, gXpSleepSafety = 0;
+static uint64_t gXpTscPerMs = 0, gXpSleepMs = 0, gXpSleepPkgMw = 0, gXpSleepCoreMw = 0, gXpSleepHwp = 0;
+static int gXpWaitPkg = -1;
+static inline uint64_t xpRdtsc() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+// TPAUSE ecx: bit 0 = 0 selects C0.2; ends at the EDX:EAX TSC deadline (or on an external event).
+static inline void xpTpause(uint64_t deadline) {
+	asm volatile(".byte 0x66, 0x0f, 0xae, 0xf1" : : "c"(0U), "a"((uint32_t)deadline), "d"((uint32_t)(deadline >> 32)) : "cc", "memory");
+}
+static void xpCalibrate() {
+	if (gXpWaitPkg < 0) {
+		uint32_t a = 7, b, c = 0, d;
+		asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+		gXpWaitPkg = (c >> 5) & 1;
+	}
+	if (gXpTscPerMs) return;
+	const uint64_t n0 = mach_absolute_time(), t0 = xpRdtsc();
+	IODelay(20000);
+	const uint64_t n1 = mach_absolute_time(), t1 = xpRdtsc();
+	uint64_t ns = 0; absolutetime_to_nanoseconds(n1 - n0, &ns);
+	if (ns) gXpTscPerMs = (t1 - t0) * 1000000ULL / ns;
+}
 static constexpr unsigned xpGpe0Len = 16;
 static uint8_t gXpGpeEn[16];
 // The render engine (GT) keeps its state through an s2idle sleep, but the
@@ -184,6 +212,20 @@ static void xpFakeSleep(void *) {
 	for (unsigned i = 0; i < xpGpe0Len; i++) { snap[i] = xpInb(xpGpe0Sts + i); gXpGpeEn[i] = xpInb(xpGpe0Sts + 16 + i); }
 	xpOutw(xpPm1Sts, (1U << 8) | (1U << 10));   // clear PWRBTN_STS and RTC_STS (write 1 to clear)
 	uint32_t reason = 0; uint64_t loops = 0;
+	const int wait = gXpSleepWait;
+	const uint64_t tpms = gXpTscPerMs, t0 = xpRdtsc();
+	const uint64_t safety = gXpSleepSafety > 0 && tpms ? (uint64_t)gXpSleepSafety * 1000ULL * tpms : 0;
+	const uint64_t e0 = xpRdmsr(0x611) & 0xFFFFFFFFULL, c0 = xpRdmsr(0x639) & 0xFFFFFFFFULL;
+	uint64_t hwp = 0; bool hwpSet = false;
+	if (wait >= 1 && (xpRdmsr(0x770) & 1)) {
+		hwp = xpRdmsr(0x774);
+		if (!(hwp & (1ULL << 42))) {   // package control: leave it alone
+			uint64_t floor = hwp & 0xFF;
+			if (!floor) floor = (xpRdmsr(0x771) >> 24) & 0xFF;   // IA32_HWP_CAPABILITIES lowest performance
+			if (floor) { xpWrmsr(0x774, (hwp & ~0xFFFFFFULL) | floor | (floor << 8)); hwpSet = true; }
+		}
+	}
+	gXpSleepHwp = hwpSet ? hwp : 0;
 	while (!reason) {
 		const uint16_t pm1 = xpInw(xpPm1Sts);
 		if (pm1 & (1U << 8)) reason = 1;
@@ -193,9 +235,20 @@ static void xpFakeSleep(void *) {
 			if (rise) { reason = 0x100 + i * 8 + __builtin_ctz(rise); break; }
 			snap[i] = g;
 		}
-		for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
-		// Safety net while testing: about two minutes (~0.24 ms per loop measured), then wake.
-		if (++loops >= 500000 && !reason) reason = 3;
+		if (wait >= 1 && gXpWaitPkg == 1 && tpms) xpTpause(xpRdtsc() + tpms);   // ~1 ms
+		else for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
+		++loops;
+		if (!reason && safety && xpRdtsc() - t0 >= safety) reason = 3;
+	}
+	if (hwpSet) xpWrmsr(0x774, hwp);
+	{
+		const uint64_t t1 = xpRdtsc(), e1 = xpRdmsr(0x611) & 0xFFFFFFFFULL, c1 = xpRdmsr(0x639) & 0xFFFFFFFFULL;
+		const uint32_t esu = (uint32_t)(xpRdmsr(0x606) >> 8) & 0x1F;
+		const uint64_t ms = tpms ? (t1 - t0) / tpms : 0;
+		gXpSleepMs = ms;
+		// mW = (counts / 2^esu J) / (ms / 1000 s) * 1000
+		gXpSleepPkgMw = ms ? (((e1 - e0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
+		gXpSleepCoreMw = ms ? (((c1 - c0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
 	}
 	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
 	if (gXpGpuMmio) {
@@ -225,19 +278,40 @@ static int xpSleepHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_re
 	if (error || !req->newptr) return error;
 	if (value < 0 || value > 1) return EINVAL;
 	if (!gXpOrgAcpiSleep) return ENODEV;
+	if (value == 1) xpCalibrate();
 	gXpSleepMode = value;
 	return 0;
 }
-static char gXpSleepText[160];
+static int xpSleepWaitHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gXpSleepWait;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 0 || value > 1) return EINVAL;
+	gXpSleepWait = value;
+	return 0;
+}
+static int xpSleepSafetyHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gXpSleepSafety;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 0 || value > 86400) return EINVAL;
+	gXpSleepSafety = value;
+	return 0;
+}
+static char gXpSleepText[320];
 static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[40]; size_t u = 0;
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
-	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s",
-		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en);
+	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s"
+		" wait=%d waitpkg=%d safety=%d tsc_ms=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx",
+		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
+		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2stat, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, xpSleepStatHandler, "A", "s2idle status");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, s2wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepWaitHandler, "I", "s2idle wait: 0 spin, 1 low power");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, s2safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepSafetyHandler, "I", "s2idle wake after N s (0 never)");
 
 void xePmInstall(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-wex-pm")) return;
@@ -288,6 +362,8 @@ void xePmInstall(KernelPatcher &patcher) {
 		sysctl_register_oid(&sysctl__debug_xepm_s2idle);
 		if (gXpOrgAcpiSleep) registerPrioritySleepWakeInterest(xpSleepInterest, nullptr, nullptr);
 		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
+		sysctl_register_oid(&sysctl__debug_xepm_s2wait);
+		sysctl_register_oid(&sysctl__debug_xepm_s2safety);
 	}
 	uint64_t dl;
 	thread_call_t t20 = thread_call_allocate(xpApply, nullptr), t60 = thread_call_allocate(xpApply, nullptr);
