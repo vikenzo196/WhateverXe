@@ -120,7 +120,26 @@ static int xpD3() {
 	return n;
 }
 
+// ─── S0ixSleep (separate kext) owning the system sleep: boot-arg -wex-s0ixsleep ─────────────────────────────────
+// XE-PM then leaves acpi_sleep_kernel to S0ixSleep, and the display code follows S0ixSleep's sleep state through the
+// structure it publishes on IOResources ("S0ixSleep": OSData with its address, version 1). The pointer is looked up
+// from thread context (xpApply at 20/60 s, s2stat) and only read elsewhere.
+struct XpS0ixShared { uint32_t version; volatile uint32_t enabled, sleeping, sleeps, reason; };
+static bool gXpS0ixMode = false;
+static const XpS0ixShared *gXpS0ix = nullptr;
+static void xpFindS0ix() {
+	if (!gXpS0ixMode || __atomic_load_n(&gXpS0ix, __ATOMIC_ACQUIRE)) return;
+	IOService *res = IOService::getResourceService();
+	OSData *d = res ? OSDynamicCast(OSData, res->getProperty("S0ixSleep")) : nullptr;
+	if (!d || d->getLength() != 8) return;
+	uint64_t a = 0;
+	memcpy(&a, d->getBytesNoCopy(), sizeof(a));
+	auto *sh = reinterpret_cast<const XpS0ixShared *>(a);
+	if (sh && sh->version == 1) __atomic_store_n(&gXpS0ix, sh, __ATOMIC_RELEASE);
+}
+static inline const XpS0ixShared *xpS0ix() { return __atomic_load_n(&gXpS0ix, __ATOMIC_ACQUIRE); }
 static void xpApply(thread_call_param_t, thread_call_param_t) {
+	xpFindS0ix();
 	gXpCst = xpCstFix();
 	gXpD3 += xpD3();
 	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
@@ -264,11 +283,11 @@ static uint8_t gXpGpeEn[16];
 static volatile uint8_t *gXpGpuMmio = nullptr;
 static uint32_t gXpGdrst = 0;
 void xePmSetGpuMmio(volatile uint8_t *mmio) { gXpGpuMmio = mmio; }
-bool xePmS2idleActive() { return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
+bool xePmS2idleActive() { if (const XpS0ixShared *s = xpS0ix()) return s->enabled != 0; return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
 // True from kIOMessageSystemWillSleep to kIOMessageSystemHasPoweredOn of a system sleep taken with s2idle armed:
 // the display/GT changes for a power-kept sleep apply only inside that window, never at runtime.
 static volatile bool gXpSystemSleeping = false;
-bool xePmS2idleSleeping() { return __atomic_load_n(&gXpSystemSleeping, __ATOMIC_ACQUIRE); }
+bool xePmS2idleSleeping() { if (const XpS0ixShared *s = xpS0ix()) return __atomic_load_n(&s->sleeping, __ATOMIC_ACQUIRE) != 0; return __atomic_load_n(&gXpSystemSleeping, __ATOMIC_ACQUIRE); }
 // An s2idle wake always comes back as a dark wake (no wake reason XNU recognises as user input);
 // the first key or the power button is consumed by the wait (EC query) and macOS then waits for
 // another HID event to light the display. After a wake caused by the user (PWRBTN, a non-ignored
@@ -300,7 +319,7 @@ static IOReturn xpSleepInterest(void *, void *, UInt32 type, IOService *, void *
 	else if (type == kIOMessageSystemHasPoweredOn) __atomic_store_n(&gXpSystemSleeping, false, __ATOMIC_RELEASE);
 	return kIOReturnSuccess;
 }
-uint32_t xePmS2idleSleeps() { return __atomic_load_n(&gXpSleepCount, __ATOMIC_ACQUIRE); }
+uint32_t xePmS2idleSleeps() { if (const XpS0ixShared *s = xpS0ix()) return __atomic_load_n(&s->sleeps, __ATOMIC_ACQUIRE); return __atomic_load_n(&gXpSleepCount, __ATOMIC_ACQUIRE); }
 // ─── MWAIT wait machinery (tested at runtime by debug.xepm.mwtest, used by the sleep wait with s2wait 2) ─────────
 // The TPAUSE wait is C0, so the package stays in PC0 (~2.9 W). For a deep MWAIT the core needs a wake event: the
 // LAPIC timer in TSC deadline mode, pointed at vector 0xF2 of a copy of the kernel's IDT (gate: EOI + iretq), with
@@ -604,6 +623,7 @@ static int xpSleepSafetyHandler(struct sysctl_oid *oidp, void *, int, struct sys
 }
 static char gXpSleepText[960];
 static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	xpFindS0ix();
 	char en[40]; size_t u = 0;
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
 	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s"
@@ -611,14 +631,15 @@ static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u"
 		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u pp1_mw=%llu psys_mw=%llu pkgcst=0x%llx msrok=0x%x"
 		" rc6=%u gtcore=0x%x/0x%x trans=0x%x plane=0x%x dc=0x%x pwell=0x%x pipemisc=0x%x"
-		" mw=%u period_ms=%d mwirq=%u mw_c6_ms=%llu mw_c7_ms=%llu apic_found=0x%llx svr_found=0x%x mwfail=%u",
+		" mw=%u period_ms=%d mwirq=%u mw_c6_ms=%llu mw_c7_ms=%llu apic_found=0x%llx svr_found=0x%x mwfail=%u s0ix=%d/%d",
 		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
 		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp,
 		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3], gXpUserWakeCount,
 		gXpResPm[0], gXpResPm[1], gXpResPm[2], gXpResPm[3], gXpResPm[4], gXpResPm[5], gXpResPm[6],
 		gXpPp1Mw, gXpPsysMw, gXpPkgCst, gXpMsrOk,
 		gXpRc6, gXpGtCore[0], gXpGtCore[1], gXpDisp[0], gXpDisp[1], gXpDisp[2], gXpDisp[3], gXpDisp[4],
-		gXpMwUsed, gXpSleepPeriodMs, gXpMwSleepIrq, gXpMwSleepC6, gXpMwSleepC7, gXpMwFoundBase, gXpMwFoundSvr, gXpMwFail);
+		gXpMwUsed, gXpSleepPeriodMs, gXpMwSleepIrq, gXpMwSleepC6, gXpMwSleepC7, gXpMwFoundBase, gXpMwFoundSvr, gXpMwFail,
+		gXpS0ixMode ? 1 : 0, xpS0ix() ? 1 : 0);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
@@ -780,16 +801,17 @@ void xePmInstall(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_xepm_d3);
 	sysctl_register_oid(&sysctl__debug_xepm_route);
 	{
+		gXpS0ixMode = checkKernelArgument("-wex-s0ixsleep");
 		const mach_vm_address_t fn = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_kernel");
 		patcher.clearError();
 		static const uint8_t pro[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};   // push rbp; mov rbp,rsp; push r15; push r14
-		bool ok = fn != 0;
+		bool ok = fn != 0 && !gXpS0ixMode;
 		for (size_t i = 0; ok && i < sizeof(pro); i++) if (reinterpret_cast<const uint8_t *>(fn)[i] != pro[i]) ok = false;
 		if (ok) {
 			gXpOrgAcpiSleep = patcher.routeFunction(fn, reinterpret_cast<mach_vm_address_t>(xpAcpiSleepKernel), true);
 			if (patcher.getError() != KernelPatcher::Error::NoError) { gXpOrgAcpiSleep = 0; patcher.clearError(); }
 		}
-		gXpSleepRoute = gXpOrgAcpiSleep ? 1 : (fn ? 3 : 2);
+		gXpSleepRoute = gXpOrgAcpiSleep ? 1 : (gXpS0ixMode ? 4 : (fn ? 3 : 2));   // 4: left to S0ixSleep
 		sysctl_register_oid(&sysctl__debug_xepm_s2idle);
 		if (gXpOrgAcpiSleep) {
 			gXpRequestUserActive = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN14IOPMrootDomain17requestUserActiveEP9IOServicePKc");
