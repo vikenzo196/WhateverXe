@@ -507,7 +507,7 @@ struct __attribute__((packed)) XpIdtr { uint16_t limit; uint64_t base; };
 static void xpMwTest(int iters) {
 	int code = 0;
 	uint64_t apic = 0, dl = 0, t0 = 0, t1 = 0, c6 = 0, c7 = 0, minUs = ~0ULL, maxUs = 0;
-	uint32_t irq = 0, lvt = 0, tpr = 0, apicId = 0, irr = 0, svr = 0;
+	uint32_t irq = 0, lvt = 0, tpr = 0, apicId = 0, irr = 0, svr = 0, idtLimit = 0;
 	const uint64_t tpms = gXpTscPerMs, period = tpms * (uint64_t)gXpMwPeriodUs / 1000ULL;
 	uint32_t a = 1, b, c = 0, d;
 	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
@@ -531,8 +531,11 @@ static void xpMwTest(int iters) {
 		const boolean_t ints = ml_set_interrupts_enabled(FALSE);
 		XpIdtr kidt {};
 		asm volatile("sidt %0" : "=m"(kidt));
+		idtLimit = kidt.limit;
 		if (xpRdmsr(0x1B) != apic) code = -7;
-		else if ((size_t)kidt.limit + 1 > sizeof(gXpMwIdt) || kidt.limit < xpMwVector * 16 + 15) code = -4;
+		// XNU sets the IDT limit to 0x1000 + the CPU number (sidt gives user code its CPU number): the 256 gates are
+		// the first 4096 bytes, the limit is kept as it is.
+		else if ((size_t)kidt.limit + 1 < sizeof(gXpMwIdt)) code = -4;
 		else {
 			lvt = xpApicRd(0x320);
 			svr = xpApicRd(0xF0);
@@ -542,7 +545,7 @@ static void xpMwTest(int iters) {
 				apicId = x2 ? xpApicRd(0x20) : xpApicRd(0x20) >> 24;
 				tpr = xpApicRd(0x80);
 				dl = xpRdmsr(0x6E0);
-				memcpy(gXpMwIdt, reinterpret_cast<const void *>(kidt.base), (size_t)kidt.limit + 1);
+				memcpy(gXpMwIdt, reinterpret_cast<const void *>(kidt.base), sizeof(gXpMwIdt));
 				uint16_t cs;
 				asm volatile("mov %%cs, %0" : "=r"(cs));
 				const uint64_t h = reinterpret_cast<uint64_t>(&xpMwStub);
@@ -587,10 +590,10 @@ static void xpMwTest(int iters) {
 	const uint64_t tot = tpms && t1 > t0 ? (t1 - t0) * 1000ULL / tpms : 0;
 	snprintf(gXpMwText, sizeof(gXpMwText),
 		"code=%d iters=%d period_us=%d irq=%u total_us=%llu min_us=%llu max_us=%llu core_c6_us=%llu core_c7_us=%llu"
-		" irr_e0=0x%x apic=0x%llx mode=%s apicid=%u lvt=0x%x svr=0x%x tpr=0x%x dl_was=%d mwait=%d tscdl=%d",
+		" irr_e0=0x%x apic=0x%llx mode=%s apicid=%u lvt=0x%x svr=0x%x tpr=0x%x dl_was=%d mwait=%d tscdl=%d idt_limit=0x%x",
 		code, iters, gXpMwPeriodUs, irq, tot, minUs == ~0ULL ? 0 : minUs, maxUs,
 		tpms ? c6 * 1000ULL / tpms : 0, tpms ? c7 * 1000ULL / tpms : 0,
-		irr, apic, x2 ? "x2apic" : "xapic", apicId, lvt, svr, tpr, dl ? 1 : 0, hasMwait, hasDl);
+		irr, apic, x2 ? "x2apic" : "xapic", apicId, lvt, svr, tpr, dl ? 1 : 0, hasMwait, hasDl, idtLimit);
 }
 static int xpMwTestHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	int value = gXpMwLast;
