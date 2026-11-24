@@ -17,12 +17,15 @@ constexpr uint32_t PlaneCtl=0x70180, PlaneSurf=0x7019C; // PLANE_CTL_1_A / PLANE
 constexpr uint32_t CurCtl=0x70080, CurBase=0x70084;     // CUR_CTL_A / CUR_BASE_A
 constexpr uint32_t PlaneEnable=0x80000000U;
 constexpr uint32_t CursorMode=0x27; // MCURSOR_MODE_MASK; 0 disables the cursor.
+// PIPE_MISC_A dithering: with the plane off the pipe sends its black background, but the
+// dither noise still lights OLED subpixels faintly (a very dark green). Off while dark.
+constexpr uint32_t PipeMisc=0x70030, PipeDither=0x10;
 // Donor framebuffer power states: 0 off, 1 doze, 2 wake.
 constexpr uint32_t Wake=2;
 
 struct State {
     bool blanked {};
-    uint32_t plane {}, cursor {}; // Values seen when blanking.
+    uint32_t plane {}, cursor {}, misc {}; // Values seen when blanking.
     uint32_t blanks {}, unblanks {};
 };
 enum class Action : uint32_t { Native, Blank, Unblank, Keep };
@@ -38,6 +41,8 @@ inline Action decide(bool eligible,uint32_t current,uint32_t requested,bool blan
 }
 
 template<class IO> void blank(IO &io,State &s) {
+    s.misc=io.read(PipeMisc);
+    if(s.misc&PipeDither)io.write(PipeMisc,s.misc&~PipeDither);
     s.plane=io.read(PlaneCtl);s.cursor=io.read(CurCtl);
     io.write(CurCtl,s.cursor&~CursorMode);io.write(CurBase,io.read(CurBase));
     io.write(PlaneCtl,s.plane&~PlaneEnable);io.write(PlaneSurf,io.read(PlaneSurf));
@@ -46,6 +51,8 @@ template<class IO> void blank(IO &io,State &s) {
 // Restore only the enables: the donor may legitimately reprogram format,
 // tiling or cursor size while the panel is dark (a later flip or mode set).
 template<class IO> void unblank(IO &io,State &s) {
+    const auto misc=io.read(PipeMisc);
+    if((s.misc&PipeDither) && !(misc&PipeDither))io.write(PipeMisc,misc|PipeDither);
     const auto plane=io.read(PlaneCtl);
     io.write(PlaneCtl,plane|(s.plane&PlaneEnable));io.write(PlaneSurf,io.read(PlaneSurf));
     const auto cursor=io.read(CurCtl);

@@ -14,6 +14,7 @@ static IO live() {
     IO io;
     io.r[PlaneCtl]=0x84001008U; io.r[PlaneSurf]=0x00200000U;
     io.r[CurCtl]=0x04000027U; io.r[CurBase]=0x01230000U;
+    io.r[PipeMisc]=0x01800010U;
     return io;
 }
 int main() {
@@ -36,14 +37,15 @@ int main() {
     assert(s.blanked && s.blanks==1);
     assert(io.r[PlaneCtl]==0x04001008U && io.r[PlaneSurf]==0x00200000U);
     assert(io.r[CurCtl]==0x04000000U && io.r[CurBase]==0x01230000U);
-    assert((io.writes==std::vector<uint32_t>{CurCtl,CurBase,PlaneCtl,PlaneSurf}));
+    assert(io.r[PipeMisc]==0x01800000U && s.misc==0x01800010U);
+    assert((io.writes==std::vector<uint32_t>{PipeMisc,CurCtl,CurBase,PlaneCtl,PlaneSurf}));
 
     // Unblank restores the enables, latching after each control write.
     io.writes.clear();
     unblank(io,s);
     assert(!s.blanked && s.unblanks==1);
-    assert(io.r[PlaneCtl]==0x84001008U && io.r[CurCtl]==0x04000027U);
-    assert((io.writes==std::vector<uint32_t>{PlaneCtl,PlaneSurf,CurCtl,CurBase}));
+    assert(io.r[PlaneCtl]==0x84001008U && io.r[CurCtl]==0x04000027U && io.r[PipeMisc]==0x01800010U);
+    assert((io.writes==std::vector<uint32_t>{PipeMisc,PlaneCtl,PlaneSurf,CurCtl,CurBase}));
 
     // A donor reprogramming while dark is kept; only the enable comes back.
     io=live();State t;blank(io,t);
@@ -55,8 +57,15 @@ int main() {
     io=live();State u;blank(io,u);
     io.r[CurCtl]=0x04000022U;io.writes.clear();
     unblank(io,u);
-    assert((io.writes==std::vector<uint32_t>{PlaneCtl,PlaneSurf}));
+    assert((io.writes==std::vector<uint32_t>{PipeMisc,PlaneCtl,PlaneSurf}));
     assert(io.r[CurCtl]==0x04000022U);
+
+    // Dithering already off stays off; one the donor re-enabled while dark is not rewritten.
+    io=live();io.r[PipeMisc]=0x01800000U;State w;io.writes.clear();blank(io,w);
+    assert(io.writes.front()==CurCtl && io.r[PipeMisc]==0x01800000U);
+    unblank(io,w);assert(io.r[PipeMisc]==0x01800000U);
+    io=live();State x;blank(io,x);io.r[PipeMisc]=0x01800010U;io.writes.clear();unblank(io,x);
+    assert(io.writes.front()==PlaneCtl && io.r[PipeMisc]==0x01800010U);
 
     // A plane that was already off stays off.
     io=live();io.r[PlaneCtl]=0x04001008U;State v;blank(io,v);unblank(io,v);
