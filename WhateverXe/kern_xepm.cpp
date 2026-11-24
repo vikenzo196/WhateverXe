@@ -28,6 +28,8 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
 #include <sys/sysctl.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 
 extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
 
@@ -166,6 +168,15 @@ static volatile uint8_t *gXpGpuMmio = nullptr;
 static uint32_t gXpGdrst = 0;
 void xePmSetGpuMmio(volatile uint8_t *mmio) { gXpGpuMmio = mmio; }
 bool xePmS2idleActive() { return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
+// True from kIOMessageSystemWillSleep to kIOMessageSystemHasPoweredOn of a system sleep taken with s2idle armed:
+// the display/GT changes for a power-kept sleep apply only inside that window, never at runtime.
+static volatile bool gXpSystemSleeping = false;
+bool xePmS2idleSleeping() { return __atomic_load_n(&gXpSystemSleeping, __ATOMIC_ACQUIRE); }
+static IOReturn xpSleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
+	if (type == kIOMessageSystemWillSleep && xePmS2idleActive()) __atomic_store_n(&gXpSystemSleeping, true, __ATOMIC_RELEASE);
+	else if (type == kIOMessageSystemHasPoweredOn) __atomic_store_n(&gXpSystemSleeping, false, __ATOMIC_RELEASE);
+	return kIOReturnSuccess;
+}
 uint32_t xePmS2idleSleeps() { return __atomic_load_n(&gXpSleepCount, __ATOMIC_ACQUIRE); }
 static void xpFakeSleep(void *) {
 	uint8_t snap[xpGpe0Len];
@@ -188,11 +199,19 @@ static void xpFakeSleep(void *) {
 	}
 	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
 	if (gXpGpuMmio) {
+		// Hold forcewake across the reset like Linux __intel_gt_reset (render, GT, media domains: request/ack).
+		static constexpr uint32_t fw[4][2] = {{0xA278, 0x0D84}, {0xA188, 0x130044}, {0xA540, 0x0D50}, {0xA560, 0x0D70}};
+		auto reg = [](uint32_t r) { return reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + r); };
+		for (auto &f : fw) {
+			*reg(f[0]) = 0x00010001U;
+			for (unsigned spins = 0; !(*reg(f[1]) & 1U) && spins < 200; spins++) for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
+		}
 		auto gdrst = reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + 0x941C);
 		*gdrst = 1U;   // GRDOM_FULL
 		uint32_t spins = 0;
 		while ((*gdrst & 1U) && spins < 2000) { for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause(); spins++; }
 		gXpGdrst = (*gdrst & 1U) ? 0x80000000U | spins : spins + 1;
+		for (auto &f : fw) *reg(f[0]) = 0x00010000U;
 	}
 	gXpSleepReason = reason; gXpSleepLoops = loops; gXpSleepCount++;
 }
@@ -267,6 +286,7 @@ void xePmInstall(KernelPatcher &patcher) {
 		}
 		gXpSleepRoute = gXpOrgAcpiSleep ? 1 : (fn ? 3 : 2);
 		sysctl_register_oid(&sysctl__debug_xepm_s2idle);
+		if (gXpOrgAcpiSleep) registerPrioritySleepWakeInterest(xpSleepInterest, nullptr, nullptr);
 		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
 	}
 	uint64_t dl;

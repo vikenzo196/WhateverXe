@@ -9413,6 +9413,7 @@ bool XE::display13EDPBlankActive=false;
 // on the same function: it only validates the donor entry and enables the
 // blank decision, which wrapDisplay13SetPowerState consults first for non-DSI
 // framebuffers (display13EDPBlankPower).
+static mach_vm_address_t display13FBStopTransactions=0,display13FBRestoreTransactions=0;
 bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  display13EDPBlankActive=false;
  if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;
@@ -9420,44 +9421,64 @@ bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_ad
  const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
  if(fn!=address+0x24DE8 || !orgDSIAttributes[2])return false;
  display13EDPBlankActive=true;
+ // s2idle sleep: replay the donor's own transaction stop/restore around a kept-link
+ // system sleep (local symbols of the same exact image as setFramebufferPowerState).
+ display13FBStopTransactions=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer16StopTransactionsEv",address,size);patcher.clearError();
+ display13FBRestoreTransactions=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer19RestoreTransactionsEb",address,size);patcher.clearError();
+ if(display13FBStopTransactions!=address+0x38B12)display13FBStopTransactions=0;
+ if(display13FBRestoreTransactions!=address+0x33E4E)display13FBRestoreTransactions=0;
  return true;
 }
 // Returns true when the kept eDP transition was handled here (result set);
 // false means the caller continues with the native/0.8.0 power path.
-uint32_t xePmS2idleSleeps();
+bool xePmS2idleSleeping();
 // IOFramebuffer clears pagingState for every framebuffer at system sleep and
-// only sets it again from the driver's kIOFBNotifyDidWake (handleEvent on the
-// controller power thread). The kept eDP framebuffer skips the donor's native
-// wake, so after an s2idle sleep send that event ourselves on its wake.
-static uint32_t display13EDPBlankSleepsSeen=0;
-// handleEvent is protected in IOFramebuffer; reach it through a member pointer
-// named via a derived class (never instantiated).
-// IOGraphicsFamily is not in our dependency set: no IOFramebuffer symbol may be
-// imported (metaClass, non-virtual calls). A virtual call through a derived
-// pointer uses the vtable slot from the header only.
-extern mach_vm_address_t gWEXFBHandleEvent; // kern_host.cpp, solved when IOGraphicsFamily loads
+// only sets it again from the driver's events (handleEvent on the controller
+// power thread). The kept eDP framebuffer skips the donor's native sleep and
+// wake (link teardown/retrain), so during an s2idle system sleep replay the
+// donor's own bookends around the blank: at sleep StopTransactions, WillPowerOff
+// and DidPowerOff; at the first wake request DidWake; at Wake WillPowerOn,
+// DidPowerOn and RestoreTransactions(true) (last flip, colour pipeline, gamma).
+extern mach_vm_address_t gWEXFBHandleEvent; // kern_xe host, solved when IOGraphicsFamily loads
 struct Display13FBEventAccess {
  static IOReturn send(IOService *fb,IOIndex event,void *info) {
   if(!gWEXFBHandleEvent)return kIOReturnUnsupported;
   return reinterpret_cast<IOReturn (*)(IOService *,IOIndex,void *)>(gWEXFBHandleEvent)(fb,event,info);
  }
 };
+static IOService *display13EDPS2Sleeping=nullptr; // FB blanked by an s2idle system sleep
+static bool display13EDPS2DidWakeSent=false;
+static uint32_t display13EDPS2Record[12]={1};
 bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
+ const bool sleeping=xePmS2idleSleeping();
  const bool handled=display13EDPBlankPowerImpl(fb,state,result);
- if(handled && state==Display13EDPBlank::Wake && fb) {
-  const auto sleeps=xePmS2idleSleeps();
-  if(sleeps!=display13EDPBlankSleepsSeen) {
-   display13EDPBlankSleepsSeen=sleeps;
-   auto framebuffer=fb->metaCast("IOFramebuffer") ? fb : nullptr;
-   const IOReturn r=framebuffer ? Display13FBEventAccess::send(framebuffer,kIOFBNotifyDidWake,reinterpret_cast<void *>(1)) : kIOReturnUnsupported;
-   uint32_t record[]={1,sleeps,static_cast<uint32_t>(r),framebuffer!=nullptr};
-   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankDidWake",record,sizeof(record));
+ auto &r=display13EDPS2Record;bool changed=false;
+ if(handled && fb && fb->metaCast("IOFramebuffer")) {
+  if(sleeping && state<Display13EDPBlank::Wake && !display13EDPS2Sleeping) {
+   display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;
+   if(display13FBStopTransactions)reinterpret_cast<void (*)(IOService *)>(display13FBStopTransactions)(fb);
+   r[1]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOff,nullptr);
+   r[2]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOff,nullptr);
+   r[3]=state;++r[11];changed=true;
+  } else if(fb==display13EDPS2Sleeping && state>=1) {
+   if(!display13EDPS2DidWakeSent) {
+    r[4]=Display13FBEventAccess::send(fb,kIOFBNotifyDidWake,reinterpret_cast<void *>(1));
+    display13EDPS2DidWakeSent=true;
+   }
+   if(state==Display13EDPBlank::Wake) {
+    r[5]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOn,nullptr);
+    r[6]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOn,nullptr);
+    if(display13FBRestoreTransactions)reinterpret_cast<void (*)(IOService *,bool)>(display13FBRestoreTransactions)(fb,true);
+    r[7]=display13FBRestoreTransactions!=0;
+    display13EDPS2Sleeping=nullptr;
+   }
+   r[8]=state;r[9]=gWEXFBHandleEvent!=0;r[10]=display13FBStopTransactions!=0;++r[11];changed=true;
   }
  }
+ if(changed)IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPS2Wake",r,sizeof(r));
  return handled;
 }
 static IOService *display13EDPBlankedFB=nullptr;
-bool xePmS2idleActive();
 bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &result) {
  namespace B=Display13EDPBlank;
  if(!display13EDPBlankActive)return false;
@@ -9472,7 +9493,7 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
    Display13FBMemory::field<void *>(fb,0x1D0)==c.controller && Display13FBMemory::boundPipe(c.pipe,fb)==0;
   // During an s2idle system sleep the donor may release FB0's scanout binding
   // while the panel is blanked; the framebuffer we blanked stays ours to wake.
-  if(!eligible && mapped && b.blanked && fb==display13EDPBlankedFB && xePmS2idleActive())eligible=true;
+  if(!eligible && mapped && b.blanked && fb==display13EDPBlankedFB && (xePmS2idleSleeping() || fb==display13EDPS2Sleeping))eligible=true;
   action=mapped ? B::decide(eligible,current,state,b.blanked) : B::Action::Native;
   struct IO {
    uintptr_t base;
@@ -11911,7 +11932,7 @@ bool xePmS2idleActive();
 // retrained on wake); -wex-edp-blank already darkens the panel.
 static volatile uint32_t display13S2idleSkips=0;
 void XE::wrapAlderLakeNEngineDisable(void *power) {
-	if(xePmS2idleActive()){__atomic_add_fetch(&display13S2idleSkips,1,__ATOMIC_RELAXED);
+	if(xePmS2idleSleeping()){__atomic_add_fetch(&display13S2idleSkips,1,__ATOMIC_RELAXED);
 		uint32_t r[]={1,1,display13S2idleSkips};IORegistryEntry::getRegistryRoot()->setProperty("WEXS2idleDisplay",r,sizeof(r));return;}
     stopDisplay13Engine(power,false);
 }
@@ -12038,7 +12059,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	if(!enable && callbackXE->display13ShutdownPowerCaller &&
 	   reinterpret_cast<uintptr_t>(__builtin_return_address(0))==callbackXE->display13ShutdownPowerCaller)
 		finishDisplay13TCShutdown(c.controller);
-	if(!enable && xePmS2idleActive()) {
+	if(!enable && xePmS2idleSleeping()) {
 		WEXPSR::snapshot("WEXS2Pre");
 		__atomic_add_fetch(&display13S2idleSkips,1,__ATOMIC_RELAXED);
 		uint32_t r[]={1,2,display13S2idleSkips};IORegistryEntry::getRegistryRoot()->setProperty("WEXS2idleDisplay",r,sizeof(r));
@@ -12248,7 +12269,7 @@ bool XE::prepareDisplay13Wake(IOService *fb) {
 
 void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
     auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
-    if(xePmS2idleActive())WEXPSR::snapshot("WEXS2Post");
+    if(xePmS2idleSleeping())WEXPSR::snapshot("WEXS2Post");
     IOLockLock(c.lock);const bool ready=restoreDisplay13ResourcesLocked(power,waking);
     auto controller=static_cast<IOService *>(c.controller);IOLockUnlock(c.lock);
     if(ready)restoreDisplay13Ports(controller);
@@ -17362,7 +17383,21 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+void XE::wrapTGLCSBWake(void *streamer) {
+ // Wake follows the boot order: the native wake then runs startGraphicsEngine
+ // (initModeRegisters, HWS_PGA) before its first submission. Arm CSB12 in
+ // memory now and program the hardware at that first submission, after the RCS
+ // mode/HWS replay, exactly like after start (wrapTGLCSBInit / wrapTGLHostSubmit).
+ // Initializing here sampled GFX_MODE and wrote the CSB pointer before the
+ // engine was reprogrammed (EL-null panic after an s2idle wake).
+ TGLCSBIO io(streamer,0);auto &e=tglCSBEngines[io.engine];
+ e.streamer=streamer;e.hardwareReady=false;
+ io.writeTail(TGLCSB::ResetIndex);
+ for (unsigned i=0;i<TGLCSB::Capacity;++i) io.writeEntry(i,TGLCSB::Sentinel);
+ io.flushEntriesAndTail();e.state.head=TGLCSB::ResetIndex;e.state.error=TGLCSB::Error::None;
+ *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=e.state.head;
+ ++e.resets;
+}
 void XE::wrapTGLCSBReset(void *streamer) {
  // RCS replay (HWS_PGA, GFX_MODE, ...) must precede CSB12 init, which samples GFX_MODE.
  const auto scope=tglResetViaCSB ? tglResetCSBefore() : TGLResetCSScope{};
