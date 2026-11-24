@@ -218,7 +218,7 @@ static int gXpWaitPkg = -1;
 // MSR) when s2idle is armed; the wait reads only those that answered.
 static mach_vm_address_t gXpRdmsrCarefully = 0;
 static constexpr uint32_t xpResMsr[7] = {0x60D, 0x3F8, 0x3F9, 0x3FA, 0x630, 0x631, 0x632};   // PC2 PC3 PC6 PC7 PC8 PC9 PC10
-static uint32_t gXpMsrOk = 0;   // bits 0-6 xpResMsr, 8 PP1 0x641, 9 PSYS 0x64D, 10 PKG_CST_CONFIG 0xE2, 31 probed
+static uint32_t gXpMsrOk = 0;   // bits 0-6 xpResMsr, 8 PP1 0x641, 9 PSYS 0x64D, 10 PKG_CST_CONFIG 0xE2, 11/12 core C6/C7, 31 probed
 static uint32_t gXpResPm[7];
 static uint64_t gXpPp1Mw = 0, gXpPsysMw = 0, gXpPkgCst = 0;
 static uint32_t gXpRc6 = 0, gXpGtCore[2], gXpDisp[5];   // RC6 counter delta; GT core status start/end; display regs
@@ -230,6 +230,8 @@ static void xpProbeMsrs() {
 	if (rd(0x641, &lo, &hi) == 0) ok |= 1U << 8;
 	if (rd(0x64D, &lo, &hi) == 0) ok |= 1U << 9;
 	if (rd(0xE2, &lo, &hi) == 0) { ok |= 1U << 10; gXpPkgCst = ((uint64_t)hi << 32) | lo; }
+	if (rd(0x3FD, &lo, &hi) == 0) ok |= 1U << 11;   // core C6 residency
+	if (rd(0x3FE, &lo, &hi) == 0) ok |= 1U << 12;   // core C7 residency
 	gXpMsrOk = ok;
 }
 static inline uint64_t xpRdtsc() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
@@ -451,6 +453,142 @@ SYSCTL_PROC(_debug_xepm, OID_AUTO, s2stat, CTLTYPE_STRING | CTLFLAG_RD, nullptr,
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepWaitHandler, "I", "s2idle wait: 0 spin, 1 low power");
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepSafetyHandler, "I", "s2idle wake after N s (0 never)");
 
+// ─── 7: MWAIT wait test (runtime, opt-in) ──────────────────────────────────────────────────────────────────────
+// The s2idle wait polls in TPAUSE C0.2, which is C0: with one core in C0 the package never leaves PC0 (measured:
+// PC2..PC10 all 0, ~2.9 W). A deep MWAIT needs a wake event, and in the sleep callback the local APIC is off.
+// This test checks, while the system runs, the mechanism the wait would use: on the current CPU, interrupts off,
+// a copy of the kernel's IDT with one extra gate (vector 0xF2, EOI + iretq) is loaded, the task priority is raised
+// so that only vectors >= 0xF0 are delivered, the LAPIC timer (TSC deadline mode, as XNU programs it) is pointed
+// at 0xF2, and N times: deadline = now + period, then sti; MWAIT C10; cli. Everything is put back as it was
+// (IDT, TPR, LVT timer, XNU's own deadline). x2APIC mode only. sysctl debug.xepm.mwtest=N (1..50) runs it,
+// debug.xepm.mwperiod sets the period in us (N * period <= 100 ms), debug.xepm.mwstat has the result.
+extern "C" {
+__attribute__((used)) volatile uint32_t gXpMwIrq = 0;
+void xpMwStub();
+}
+asm(R"(
+	.section __TEXT,__text,regular,pure_instructions
+	.p2align 4
+	.private_extern _xpMwStub
+_xpMwStub:
+	.byte 0xf3, 0x0f, 0x1e, 0xfa
+	pushq %rax
+	pushq %rcx
+	pushq %rdx
+	lock incl _gXpMwIrq(%rip)
+	movl $0x80B, %ecx
+	xorl %eax, %eax
+	xorl %edx, %edx
+	wrmsr
+	popq %rdx
+	popq %rcx
+	popq %rax
+	iretq
+)");
+static constexpr uint8_t xpMwVector = 0xF2;
+alignas(4096) static uint8_t gXpMwIdt[4096];
+alignas(64) static volatile uint64_t gXpMwMonitor[8];
+static int gXpMwPeriodUs = 2000, gXpMwLast = 0;
+static char gXpMwText[400];
+struct __attribute__((packed)) XpIdtr { uint16_t limit; uint64_t base; };
+static void xpMwTest(int iters) {
+	int code = 0;
+	uint64_t apic = 0, lvt = 0, tpr = 0, dl = 0, apicId = 0, t0 = 0, t1 = 0, c6 = 0, c7 = 0, irr = 0, minUs = ~0ULL, maxUs = 0;
+	uint32_t irq = 0;
+	const uint64_t tpms = gXpTscPerMs, period = tpms * (uint64_t)gXpMwPeriodUs / 1000ULL;
+	uint32_t a = 1, b, c = 0, d;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+	const bool hasMwait = (c >> 3) & 1, hasX2 = (c >> 21) & 1, hasDl = (c >> 24) & 1;
+	const uint32_t mok = gXpMsrOk;
+	if (!hasMwait || !hasX2 || !hasDl) code = -1;
+	else if (!period) code = -2;
+	else {
+		const boolean_t ints = ml_set_interrupts_enabled(FALSE);
+		apic = xpRdmsr(0x1B);
+		XpIdtr kidt {};
+		asm volatile("sidt %0" : "=m"(kidt));
+		if ((apic & 0xC00) != 0xC00) code = -3;   // not in x2APIC mode
+		else if ((size_t)kidt.limit + 1 > sizeof(gXpMwIdt) || kidt.limit < xpMwVector * 16 + 15) code = -4;
+		else {
+			lvt = xpRdmsr(0x832);
+			if (((lvt >> 17) & 3) != 2) code = -5;   // XNU's timer not in TSC deadline mode: leave it alone
+			else {
+				apicId = xpRdmsr(0x802);
+				tpr = xpRdmsr(0x808);
+				dl = xpRdmsr(0x6E0);
+				memcpy(gXpMwIdt, reinterpret_cast<const void *>(kidt.base), (size_t)kidt.limit + 1);
+				uint16_t cs;
+				asm volatile("mov %%cs, %0" : "=r"(cs));
+				const uint64_t h = reinterpret_cast<uint64_t>(&xpMwStub);
+				uint8_t *g = gXpMwIdt + xpMwVector * 16;
+				g[0] = (uint8_t)h; g[1] = (uint8_t)(h >> 8); g[2] = (uint8_t)cs; g[3] = (uint8_t)(cs >> 8);
+				g[4] = 0; g[5] = 0x8E;   // IST 0; present, DPL 0, 64-bit interrupt gate
+				g[6] = (uint8_t)(h >> 16); g[7] = (uint8_t)(h >> 24);
+				for (unsigned i = 0; i < 4; i++) g[8 + i] = (uint8_t)(h >> (32 + 8 * i));
+				g[12] = g[13] = g[14] = g[15] = 0;
+				XpIdtr ours {kidt.limit, reinterpret_cast<uint64_t>(gXpMwIdt)};
+				asm volatile("lidt %0" : : "m"(ours) : "memory");
+				xpWrmsr(0x808, 0xE0);
+				xpWrmsr(0x832, (lvt & ~0x100FFULL) | xpMwVector);   // unmask, our vector, mode kept
+				const uint64_t c6a = (mok & (1U << 11)) ? xpRdmsr(0x3FD) : 0, c7a = (mok & (1U << 12)) ? xpRdmsr(0x3FE) : 0;
+				const uint32_t irq0 = gXpMwIrq;
+				t0 = xpRdtsc();
+				for (int i = 0; i < iters; i++) {
+					const uint64_t st = xpRdtsc();
+					xpWrmsr(0x6E0, st + period);
+					asm volatile(".byte 0x0f, 0x01, 0xc8" : : "a"(gXpMwMonitor), "c"(0U), "d"(0U) : "memory");   // MONITOR
+					asm volatile("sti\n\t.byte 0x0f, 0x01, 0xc9\n\tcli" : : "a"(0x60U), "c"(1U) : "memory");   // MWAIT C10
+					const uint64_t us = (xpRdtsc() - st) * 1000ULL / tpms;
+					if (us < minUs) minUs = us;
+					if (us > maxUs) maxUs = us;
+				}
+				t1 = xpRdtsc();
+				irq = gXpMwIrq - irq0;
+				c6 = (mok & (1U << 11)) ? xpRdmsr(0x3FD) - c6a : 0;
+				c7 = (mok & (1U << 12)) ? xpRdmsr(0x3FE) - c7a : 0;
+				xpWrmsr(0x6E0, 0);
+				asm volatile("sti\n\tnop\n\tnop\n\tcli" : : : "memory");   // a deadline that fired after the last cli lands here
+				irr = xpRdmsr(0x827);   // IRR 0xE0..0xFF
+				xpWrmsr(0x832, lvt);
+				xpWrmsr(0x808, tpr);
+				asm volatile("lidt %0" : : "m"(kidt) : "memory");
+				if (dl) xpWrmsr(0x6E0, dl);   // XNU's deadline (fires at once if it already passed)
+			}
+		}
+		ml_set_interrupts_enabled(ints);
+	}
+	gXpMwLast = code ? code : iters;
+	const uint64_t tot = tpms && t1 > t0 ? (t1 - t0) * 1000ULL / tpms : 0;
+	snprintf(gXpMwText, sizeof(gXpMwText),
+		"code=%d iters=%d period_us=%d irq=%u total_us=%llu min_us=%llu max_us=%llu core_c6_us=%llu core_c7_us=%llu"
+		" irr_e0=0x%llx apic=0x%llx apicid=%llu lvt=0x%llx tpr=0x%llx dl_was=%d mwait=%d x2apic=%d tscdl=%d",
+		code, iters, gXpMwPeriodUs, irq, tot, minUs == ~0ULL ? 0 : minUs, maxUs,
+		tpms ? c6 * 1000ULL / tpms : 0, tpms ? c7 * 1000ULL / tpms : 0,
+		irr, apic, apicId, lvt, tpr, dl ? 1 : 0, hasMwait, hasX2, hasDl);
+}
+static int xpMwTestHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gXpMwLast;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 1 || value > 50 || (int64_t)value * gXpMwPeriodUs > 100000) return EINVAL;
+	xpMwTest(value);
+	return 0;
+}
+static int xpMwPeriodHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gXpMwPeriodUs;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 100 || value > 10000) return EINVAL;
+	gXpMwPeriodUs = value;
+	return 0;
+}
+static int xpMwStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	return sysctl_handle_string(oidp, gXpMwText, sizeof(gXpMwText), req);
+}
+SYSCTL_PROC(_debug_xepm, OID_AUTO, mwtest, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpMwTestHandler, "I", "run the MWAIT wait test N times");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, mwperiod, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpMwPeriodHandler, "I", "MWAIT test period (us)");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, mwstat, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, xpMwStatHandler, "A", "MWAIT test result");
+
 void xePmInstall(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-wex-pm")) return;
 	gXpOn = true;
@@ -509,6 +647,9 @@ void xePmInstall(KernelPatcher &patcher) {
 		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
 		sysctl_register_oid(&sysctl__debug_xepm_s2wait);
 		sysctl_register_oid(&sysctl__debug_xepm_s2safety);
+		sysctl_register_oid(&sysctl__debug_xepm_mwtest);
+		sysctl_register_oid(&sysctl__debug_xepm_mwperiod);
+		sysctl_register_oid(&sysctl__debug_xepm_mwstat);
 	}
 	uint64_t dl;
 	thread_call_t t20 = thread_call_allocate(xpApply, nullptr), t60 = thread_call_allocate(xpApply, nullptr);
