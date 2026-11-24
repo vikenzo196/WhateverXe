@@ -9262,6 +9262,7 @@ static bool display13FlipTraceSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+static void display13EDPBlankEnforce(IOService *fb);
 uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg,void *params) {
  auto s=callbackXE;auto &c=display13FBPower;
  volatile uint8_t *base=nullptr;
@@ -9275,6 +9276,7 @@ uint32_t XE::wrapDisplay13FlipTrace(IOService *fb,void *transaction,uint64_t arg
  __atomic_add_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
  const auto r=FunctionCast(wrapDisplay13FlipTrace,s->orgDisplay13FlipTrace)(fb,transaction,arg,params);
  __atomic_sub_fetch(&display13FlipDepth,1,__ATOMIC_RELAXED);
+ if(fbok)display13EDPBlankEnforce(fb);
  const int32_t pend1=fbok ? *reinterpret_cast<volatile int32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4008) : 0;
  if(base)for(unsigned i=0;i<5;++i)after[i]=*reinterpret_cast<volatile uint32_t *>(base+regs[i]);
  uint64_t t1;clock_get_uptime(&t1);absolutetime_to_nanoseconds(t1,&t1);
@@ -9465,6 +9467,24 @@ static IOService *display13EDPBlankedFB=nullptr;
 // cleared its pagingState (systemWork, at every system sleep) and owes DidWake.
 uint32_t xePmS2idleSleeps();
 static uint32_t display13EDPBlankSleepMark=0;
+// A flip on the blanked eDP (WindowServer draws the lock screen during a system sleep's app-ack wait
+// or a dark wake) re-enables its plane: undo it right after the donor's PerformFlipTransaction, in
+// the same frame (PLANE_SURF write latches). Try-lock only: never wait on the power path here.
+static uint32_t display13EDPBlankEnforced=0;
+static void display13EDPBlankEnforce(IOService *fb) {
+ auto &c=display13FBPower;auto &b=display13EDPBlankState;
+ if(!fb || fb!=display13EDPBlankedFB || !b.blanked || !c.lock || !c.map || c.map->getLength()!=0x1000000)return;
+ if(!IOLockTryLock(c.lock))return;
+ if(b.blanked && fb==display13EDPBlankedFB) {
+  struct IO {
+   uintptr_t base;
+   uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
+   void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
+  } io {c.map->getVirtualAddress()};
+  if(Display13EDPBlank::enforce(io,b))++display13EDPBlankEnforced;
+ }
+ IOLockUnlock(c.lock);
+}
 // [0] version, [1] WillPowerOff, [2] DidPowerOff, [3] state at sleep, [4] DidWake,
 // [5] WillPowerOn, [6] DidPowerOn, [7] transactions restored, [8] last state,
 // [9] handleEvent solved, [10] transaction trio solved, [11] count,
@@ -9596,7 +9616,7 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
  }
  // version, requested, previous, eligible, action, blanks, unblanks, plane, cursor
  display13EDPBlankLastCurrent=current;display13EDPBlankLastEligible=eligible;display13EDPBlankLastAction=static_cast<uint32_t>(action);
- const uint32_t record[9]={2,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor};
+ const uint32_t record[10]={3,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor,display13EDPBlankEnforced};
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
  if(eligible && action!=B::Action::Native){result=kIOReturnSuccess;return true;}
  return false;

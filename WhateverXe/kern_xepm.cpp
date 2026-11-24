@@ -29,6 +29,7 @@
 #include <kern/thread_call.h>
 #include <sys/sysctl.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 
 extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
@@ -156,6 +157,50 @@ static uint64_t gXpSleepLoops = 0;
 static inline uint8_t xpInb(uint16_t port) { uint8_t v; asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline uint16_t xpInw(uint16_t port) { uint16_t v; asm volatile("inw %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline void xpOutw(uint16_t port, uint16_t v) { asm volatile("outw %0, %1" : : "a"(v), "Nd"(port)); }
+static inline void xpOutb(uint16_t port, uint8_t v) { asm volatile("outb %0, %1" : : "a"(v), "Nd"(port)); }
+// The EC's SCI GPE (H_EC._GPE) ends the wait for every EC event: battery, AC, thermal, fan, USB-C,
+// Samsung SCAI, as well as the key that should wake us. When it rises with no keyboard byte waiting
+// in the 8042 (port 0x64 OBF), read the EC event (ACPI EC QR_EC 0x84 on 0x66/0x62): the firmware's
+// non-wake events (_Q51-_Q54 AC/battery, _Q57/_Q58/_Q5B, _Q60/_Q61/_Q65/_Q66 battery, _Q72-_Q76
+// thermal/fan/UCSI, _Q7C SCAI) are consumed and the wait goes on; power button (_Q50), lid (_Q5E/_Q5F),
+// no pending event or anything else still wakes. -1: EC GPE unknown, no filtering.
+static int gXpEcGpe = -1;
+static uint32_t gXpEcIgnored = 0, gXpEcLast[4] = {0x1FF, 0x1FF, 0x1FF, 0x1FF};
+static bool xpEcWait(bool obf) {
+	for (unsigned i = 0; i < 20000; i++) {
+		const uint8_t st = xpInb(0x66);
+		if (obf ? (st & 1) : !(st & 2)) return true;
+		for (unsigned k = 0; k < 50; k++) __builtin_ia32_pause();
+	}
+	return false;
+}
+static uint32_t xpEcQuery() {
+	if (!(xpInb(0x66) & 0x20)) return 0x100;   // SCI_EVT clear: no event pending
+	if (!xpEcWait(false)) return 0x101;
+	xpOutb(0x66, 0x84);
+	if (!xpEcWait(true)) return 0x102;
+	return xpInb(0x62);
+}
+static bool xpEcIgnorable(uint32_t q) {
+	switch (q) {
+		case 0x51: case 0x52: case 0x53: case 0x54: case 0x57: case 0x58: case 0x5B:
+		case 0x60: case 0x61: case 0x65: case 0x66: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x7C:
+			return true;
+	}
+	return false;
+}
+static void xpFindEcGpe() {
+	if (gXpEcGpe >= 0) return;
+	if (OSIterator *it = IOService::getMatchingServices(IOService::nameMatching("PNP0C09"))) {
+		while (auto *o = it->getNextObject()) {
+			// No IOACPIFamily link dependency: string metaCast, then the class's virtual evaluateInteger.
+			auto *dev = o->metaCast("IOACPIPlatformDevice") ? static_cast<IOACPIPlatformDevice *>(o) : nullptr;
+			UInt32 gpe = 0;
+			if (dev && dev->evaluateInteger("_GPE", &gpe) == kIOReturnSuccess && gpe < 128) { gXpEcGpe = (int)gpe; break; }
+		}
+		it->release();
+	}
+}
 static constexpr uint16_t xpPm1Sts = 0x1800, xpGpe0Sts = 0x1860;
 // Wait inside the sleep callback. XNU has already turned the other CPUs off and shut this CPU's
 // local APIC down (acpi_sleep_kernel: pmCPUExitHaltToOff, lapic_shutdown), so no interrupt can end
@@ -173,6 +218,7 @@ static inline void xpTpause(uint64_t deadline) {
 	asm volatile(".byte 0x66, 0x0f, 0xae, 0xf1" : : "c"(0U), "a"((uint32_t)deadline), "d"((uint32_t)(deadline >> 32)) : "cc", "memory");
 }
 static void xpCalibrate() {
+	xpFindEcGpe();
 	if (gXpWaitPkg < 0) {
 		uint32_t a = 7, b, c = 0, d;
 		asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
@@ -232,7 +278,20 @@ static void xpFakeSleep(void *) {
 		else if (pm1 & (1U << 10)) reason = 2;
 		else for (unsigned i = 0; i < xpGpe0Len; i++) {
 			const uint8_t g = xpInb(xpGpe0Sts + i), rise = g & ~snap[i] & gXpGpeEn[i];
-			if (rise) { reason = 0x100 + i * 8 + __builtin_ctz(rise); break; }
+			if (rise) {
+				const unsigned gpe = i * 8 + __builtin_ctz(rise);
+				if ((int)gpe == gXpEcGpe && rise == (1U << (gpe & 7)) && !(xpInb(0x64) & 1)) {
+					const uint32_t q = xpEcQuery();
+					gXpEcLast[3] = gXpEcLast[2]; gXpEcLast[2] = gXpEcLast[1]; gXpEcLast[1] = gXpEcLast[0]; gXpEcLast[0] = q;
+					if (xpEcIgnorable(q)) {
+						gXpEcIgnored++;
+						xpOutb(xpGpe0Sts + i, (uint8_t)rise);   // write-1-to-clear this GPE only
+						snap[i] = g & (uint8_t)~rise;
+						continue;
+					}
+				}
+				reason = 0x100 + gpe; break;
+			}
 			snap[i] = g;
 		}
 		if (wait >= 1 && gXpWaitPkg == 1 && tpms) xpTpause(xpRdtsc() + tpms);   // ~1 ms
@@ -303,9 +362,11 @@ static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 	char en[40]; size_t u = 0;
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
 	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s"
-		" wait=%d waitpkg=%d safety=%d tsc_ms=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx",
+		" wait=%d waitpkg=%d safety=%d tsc_ms=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx"
+		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x",
 		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
-		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp);
+		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp,
+		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3]);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");

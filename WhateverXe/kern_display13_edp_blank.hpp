@@ -50,6 +50,22 @@ template<class IO> void blank(IO &io,State &s) {
 }
 // Restore only the enables: the donor may legitimately reprogram format,
 // tiling or cursor size while the panel is dark (a later flip or mode set).
+// A donor write while dark (a flip: WindowServer still draws during a system sleep's app-ack wait or
+// a dark wake) re-enables the plane, cursor or dithering: put the dark state back and remember the
+// enables the donor asked for, so unblank restores them. Returns true when anything was undone.
+template<class IO> bool enforce(IO &io,State &s) {
+    bool changed=false;
+    const auto misc=io.read(PipeMisc);
+    if(misc&PipeDither){io.write(PipeMisc,misc&~PipeDither);s.misc|=PipeDither;changed=true;}
+    const auto cursor=io.read(CurCtl);
+    if(cursor&CursorMode) {
+        s.cursor=(s.cursor&~CursorMode)|(cursor&CursorMode);
+        io.write(CurCtl,cursor&~CursorMode);io.write(CurBase,io.read(CurBase));changed=true;
+    }
+    const auto plane=io.read(PlaneCtl);
+    if(plane&PlaneEnable){s.plane|=PlaneEnable;io.write(PlaneCtl,plane&~PlaneEnable);io.write(PlaneSurf,io.read(PlaneSurf));changed=true;}
+    return changed;
+}
 template<class IO> void unblank(IO &io,State &s) {
     const auto misc=io.read(PipeMisc);
     if((s.misc&PipeDither) && !(misc&PipeDither))io.write(PipeMisc,misc|PipeDither);

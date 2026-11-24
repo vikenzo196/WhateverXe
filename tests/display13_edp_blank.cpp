@@ -70,6 +70,15 @@ int main() {
     // A plane that was already off stays off.
     io=live();io.r[PlaneCtl]=0x04001008U;State v;blank(io,v);unblank(io,v);
     assert(io.r[PlaneCtl]==0x04001008U);
+    // A flip while dark: plane, cursor and dithering go dark again; unblank brings the donor's choice back.
+    io=live();io.r[PlaneCtl]=0x04001008U;State y;blank(io,y);       // plane was off at blank
+    assert(!enforce(io,y));                                            // nothing to undo yet
+    io.r[PlaneCtl]=0x84005008U;io.r[CurCtl]=0x04000022U;io.r[PipeMisc]=0x01800010U;io.writes.clear();
+    assert(enforce(io,y));
+    assert(io.r[PlaneCtl]==0x04005008U && io.r[CurCtl]==0x04000000U && io.r[PipeMisc]==0x01800000U);
+    assert((io.writes==std::vector<uint32_t>{PipeMisc,CurCtl,CurBase,PlaneCtl,PlaneSurf}));
+    unblank(io,y);
+    assert(io.r[PlaneCtl]==0x84005008U && io.r[CurCtl]==0x04000022U && io.r[PipeMisc]==0x01800010U);
     puts("display13_edp_blank: ok");
     return 0;
 }
