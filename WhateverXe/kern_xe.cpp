@@ -9479,9 +9479,10 @@ static uint32_t display13EDPUnblankDeferred=0,display13EDPUnblankDone=0;
 // Deferred unblank after an s2idle wake. During the sleep the donor's colour pipeline is
 // reset (pipe A GAMMA_MODE e0000001 -> 20000001) and the wake reprograms it in steps over
 // ~0.5 s (a0000001, 20000001, then e0000001 with the LUT reloaded); several donor writers
-// re-enable the plane on the way (not only PerformFlipTransaction). Every 5 ms keep plane,
-// cursor and dithering dark, and unblank once GAMMA_MODE equals the value seen when the panel
-// was blanked and has stayed so for 50 ms; give up waiting after 2 s.
+// re-enable the plane on the way (not only PerformFlipTransaction). The value at blank time is
+// no reference: macOS fades the panel through the gamma before display sleep (20000001 then).
+// Every 5 ms keep plane, cursor and dithering dark, and unblank once both gamma stages are
+// enabled again (GAMMA_MODE bits 31 and 30) for 30 ms; give up waiting after 2 s.
 // Record [0] ticks, [1] outcome (1 gamma matched, 2 timeout, 3 lost: not blanked/FB gone),
 // [2] ms to unblank, [3] undone donor writes, [4] gamma saved, [5] gamma at unblank,
 // [6] donor power state at unblank.
@@ -9505,8 +9506,8 @@ static void display13EDPUnblankWork(thread_call_param_t,thread_call_param_t) {
   else {
    if(Display13EDPBlank::enforce(io,b))++r[3];
    const uint32_t gamma=io.read(0x4A480);
-   display13EDPUnblankStable=(display13EDPBlankGamma && gamma==display13EDPBlankGamma) ? display13EDPUnblankStable+1 : 0;
-   const bool ready=display13EDPUnblankStable>=10;
+   display13EDPUnblankStable=((gamma&0xC0000000U)==0xC0000000U && gamma!=UINT32_MAX) ? display13EDPUnblankStable+1 : 0;
+   const bool ready=display13EDPUnblankStable>=6;
    if(ready || tick>=400) {
     r[1]=ready ? 1 : 2;r[2]=tick*5;r[4]=display13EDPBlankGamma;r[5]=gamma;
     r[6]=Display13FBMemory::field<uint32_t>(fb,0x4284);

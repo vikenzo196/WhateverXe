@@ -246,7 +246,30 @@ bool xePmS2idleActive() { return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
 // the display/GT changes for a power-kept sleep apply only inside that window, never at runtime.
 static volatile bool gXpSystemSleeping = false;
 bool xePmS2idleSleeping() { return __atomic_load_n(&gXpSystemSleeping, __ATOMIC_ACQUIRE); }
+// An s2idle wake always comes back as a dark wake (no wake reason XNU recognises as user input);
+// the first key or the power button is consumed by the wait (EC query) and macOS then waits for
+// another HID event to light the display. After a wake caused by the user (PWRBTN, a non-ignored
+// GPE), ask for full wake the way XNU's own dark-wake promotion does (requestUserActive), from a
+// thread call shortly after the first capability message. Not for the safety timer or the RTC.
+static volatile bool gXpUserWakePending = false;
+static thread_call_t gXpUserWakeCall = nullptr;
+static uint32_t gXpUserWakeCount = 0;
+// IOPMrootDomain::requestUserActive(IOService *, const char *), solved at install from the kernel
+// (no link-time dependency on a symbol the KPI sets may not export).
+static mach_vm_address_t gXpRequestUserActive = 0;
+static void xpUserWakeWork(thread_call_param_t, thread_call_param_t) {
+	IOPMrootDomain *root = IOService::getPMRootDomain();
+	if (root && gXpRequestUserActive) {
+		reinterpret_cast<void (*)(IOPMrootDomain *, IOService *, const char *)>(gXpRequestUserActive)(root, root, "s2idle user wake");
+		gXpUserWakeCount++;
+	}
+}
 static IOReturn xpSleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
+	if ((type == kIOMessageSystemCapabilityChange || type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) &&
+	    gXpUserWakeCall && __atomic_exchange_n(&gXpUserWakePending, false, __ATOMIC_ACQ_REL)) {
+		uint64_t deadline; clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gXpUserWakeCall, deadline);
+	}
 	if (type == kIOMessageSystemWillSleep && xePmS2idleActive()) __atomic_store_n(&gXpSystemSleeping, true, __ATOMIC_RELEASE);
 	else if (type == kIOMessageSystemHasPoweredOn) __atomic_store_n(&gXpSystemSleeping, false, __ATOMIC_RELEASE);
 	return kIOReturnSuccess;
@@ -326,6 +349,7 @@ static void xpFakeSleep(void *) {
 		for (auto &f : fw) *reg(f[0]) = 0x00010000U;
 	}
 	gXpSleepReason = reason; gXpSleepLoops = loops; gXpSleepCount++;
+	if (reason != 2 && reason != 3) __atomic_store_n(&gXpUserWakePending, true, __ATOMIC_RELEASE);
 }
 static void xpAcpiSleepKernel(xpAcpiSleepCallback func, void *refcon) {
 	if (gXpSleepMode == 1) func = xpFakeSleep;
@@ -363,10 +387,10 @@ static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
 	snprintf(gXpSleepText, sizeof(gXpSleepText), "route=%d mode=%d sleeps=%u reason=0x%x loops=%llu gdrst=0x%x gpe_en=%s"
 		" wait=%d waitpkg=%d safety=%d tsc_ms=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx"
-		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x",
+		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u",
 		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
 		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp,
-		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3]);
+		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3], gXpUserWakeCount);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
@@ -421,7 +445,12 @@ void xePmInstall(KernelPatcher &patcher) {
 		}
 		gXpSleepRoute = gXpOrgAcpiSleep ? 1 : (fn ? 3 : 2);
 		sysctl_register_oid(&sysctl__debug_xepm_s2idle);
-		if (gXpOrgAcpiSleep) registerPrioritySleepWakeInterest(xpSleepInterest, nullptr, nullptr);
+		if (gXpOrgAcpiSleep) {
+			gXpRequestUserActive = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN14IOPMrootDomain17requestUserActiveEP9IOServicePKc");
+			patcher.clearError();
+			gXpUserWakeCall = gXpRequestUserActive ? thread_call_allocate(xpUserWakeWork, nullptr) : nullptr;
+			registerPrioritySleepWakeInterest(xpSleepInterest, nullptr, nullptr);
+		}
 		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
 		sysctl_register_oid(&sysctl__debug_xepm_s2wait);
 		sysctl_register_oid(&sysctl__debug_xepm_s2safety);
