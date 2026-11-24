@@ -9476,21 +9476,50 @@ static uint32_t display13EDPBlankSleepMark=0;
 static uint32_t display13EDPBlankEnforced=0;
 static bool display13EDPUnblankPending=false;
 static uint32_t display13EDPUnblankDeferred=0,display13EDPUnblankDone=0;
+// Deferred unblank after an s2idle wake. During the sleep the donor's colour pipeline is
+// reset (pipe A GAMMA_MODE e0000001 -> 20000001) and the wake reprograms it in steps over
+// ~0.5 s (a0000001, 20000001, then e0000001 with the LUT reloaded); several donor writers
+// re-enable the plane on the way (not only PerformFlipTransaction). Every 5 ms keep plane,
+// cursor and dithering dark, and unblank once GAMMA_MODE equals the value seen when the panel
+// was blanked and has stayed so for 50 ms; give up waiting after 2 s.
+// Record [0] ticks, [1] outcome (1 gamma matched, 2 timeout, 3 lost: not blanked/FB gone),
+// [2] ms to unblank, [3] undone donor writes, [4] gamma saved, [5] gamma at unblank,
+// [6] donor power state at unblank.
+static uint32_t display13EDPBlankGamma=0,display13EDPUnblankTicks=0,display13EDPUnblankStable=0;
+static uint32_t display13EDPUnblankRecord[7];
 static void display13EDPUnblankWork(thread_call_param_t,thread_call_param_t) {
  auto &c=display13FBPower;auto &b=display13EDPBlankState;
  if(!c.lock || !c.map || c.map->getLength()!=0x1000000)return;
  IOLockLock(c.lock);
  auto fb=display13EDPBlankedFB;
- if(display13EDPUnblankPending && b.blanked && fb && Display13FBMemory::field<uint32_t>(fb,0x4284)==Display13EDPBlank::Wake) {
+ bool again=false;
+ if(display13EDPUnblankPending) {
+  auto &r=display13EDPUnblankRecord;
   struct IO {
    uintptr_t base;
    uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {c.map->getVirtualAddress()};
-  Display13EDPBlank::unblank(io,b);++display13EDPUnblankDone;
+  const uint32_t tick=++display13EDPUnblankTicks;r[0]=tick;
+  if(!b.blanked || !fb){r[1]=3;r[2]=tick*5;display13EDPUnblankPending=false;}
+  else {
+   if(Display13EDPBlank::enforce(io,b))++r[3];
+   const uint32_t gamma=io.read(0x4A480);
+   display13EDPUnblankStable=(display13EDPBlankGamma && gamma==display13EDPBlankGamma) ? display13EDPUnblankStable+1 : 0;
+   const bool ready=display13EDPUnblankStable>=10;
+   if(ready || tick>=400) {
+    r[1]=ready ? 1 : 2;r[2]=tick*5;r[4]=display13EDPBlankGamma;r[5]=gamma;
+    r[6]=Display13FBMemory::field<uint32_t>(fb,0x4284);
+    Display13EDPBlank::unblank(io,b);++display13EDPUnblankDone;display13EDPUnblankPending=false;
+   } else again=true;
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPUnblankWait",r,sizeof(r));
  }
- display13EDPUnblankPending=false;
  IOLockUnlock(c.lock);
+ if(again) {
+  uint64_t deadline;clock_interval_to_deadline(5,kMillisecondScale,&deadline);
+  thread_call_enter_delayed(display13EDPUnblankCall,deadline);
+ }
 }
 static void display13EDPBlankEnforce(IOService *fb) {
  auto &c=display13FBPower;auto &b=display13EDPBlankState;
@@ -9626,17 +9655,22 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
    uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {base};
-  if(action==B::Action::Blank){B::blank(io,b);display13EDPBlankedFB=fb;display13EDPBlankSleepMark=xePmS2idleSleeps();}
+  if(action==B::Action::Blank) {
+   B::blank(io,b);display13EDPBlankedFB=fb;display13EDPBlankSleepMark=xePmS2idleSleeps();
+   display13EDPBlankGamma=io.read(0x4A480);
+  }
   else if(action==B::Action::Unblank) {
    // After an s2idle system sleep the wake replays the donor's colour pipeline, last flip and
    // WindowServer's partial mode set; a plane enabled before that shows a transient wrong
-   // colour frame (cyan). Keep the plane dark (flips are undone meanwhile) and enable it
-   // ~300 ms later from a thread call; the power state is published as Wake right away.
+   // colour frame (cyan). Keep the plane dark and enable it once the pipe gamma is back
+   // (display13EDPUnblankWork); the power state is published as Wake right away.
    const bool s2wake=display13EDPUnblankCall && (xePmS2idleSleeping() || fb==display13EDPS2Sleeping ||
     xePmS2idleSleeps()!=display13EDPBlankSleepMark);
    if(s2wake) {
     display13EDPUnblankPending=true;++display13EDPUnblankDeferred;
-    uint64_t deadline;clock_interval_to_deadline(300,kMillisecondScale,&deadline);
+    display13EDPUnblankTicks=0;display13EDPUnblankStable=0;
+    for(auto &v:display13EDPUnblankRecord)v=0;
+    uint64_t deadline;clock_interval_to_deadline(5,kMillisecondScale,&deadline);
     thread_call_enter_delayed(display13EDPUnblankCall,deadline);
    } else B::unblank(io,b);
   }
