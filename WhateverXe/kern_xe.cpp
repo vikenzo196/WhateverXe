@@ -9626,6 +9626,11 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
   if(sleeping && state<Display13EDPBlank::Wake && !display13EDPS2Sleeping) {
    display13EDPS2Sleeping=fb;display13EDPS2Stopped=false;
    if(stop){stop(fb);display13EDPS2Stopped=true;}
+   // A donor register write outside a flip (so no enforce after it) can turn the plane back on while
+   // blanked: seen 4 s after the lid-close blank, the plane then scanned out through the whole sleep
+   // (dark green panel, PC2 instead of PC3). Darken again now that transactions are stopped; the wake's
+   // unblank restores what the donor wanted.
+   display13EDPBlankEnforce(fb);
    r[12]=Display13FBMemory::field<uint32_t>(fb,0x4004);
    r[1]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOff,nullptr);
    r[2]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOff,nullptr);
