@@ -9455,26 +9455,60 @@ struct Display13FBEventAccess {
  }
 };
 static IOService *display13EDPS2Sleeping=nullptr; // FB blanked by an s2idle system sleep
-static bool display13EDPS2DidWakeSent=false;
+static bool display13EDPS2DidWakeSent=false,display13EDPS2Stopped=false;
+static IOService *display13EDPBlankedFB=nullptr;
+// s2idle sleep count when the panel was blanked (or last woken from a system sleep).
+// A different count means a system sleep happened while it stayed blanked, whatever
+// the order of the framebuffer requests and the sleep window: IOFramebuffer then
+// cleared its pagingState (systemWork, at every system sleep) and owes DidWake.
+uint32_t xePmS2idleSleeps();
+static uint32_t display13EDPBlankSleepMark=0;
 // [0] version, [1] WillPowerOff, [2] DidPowerOff, [3] state at sleep, [4] DidWake,
 // [5] WillPowerOn, [6] DidPowerOn, [7] transactions restored, [8] last state,
 // [9] handleEvent solved, [10] transaction trio solved, [11] count,
 // [12] slot +0x4004 after StopTransactions, [13] slot at wake before setup,
-// [14] slot after RestoreTransactions, [15] pending +0x4008 after RestoreTransactions.
-static uint32_t display13EDPS2Record[16]={2};
+// [14] slot after RestoreTransactions, [15] pending +0x4008 after RestoreTransactions,
+// [16] wakes adopted after the sleep window (no sleep-side bookends), [17] s2idle sleeps.
+static uint32_t display13EDPS2Record[18]={3};
+// Fork diagnostic: the last 32 eDP blank power calls, oldest first in the serializer.
+// Per call: uptime ms, requested, donor current, eligible, action, flags (bit0 window
+// open, bit1 slept since blank, bit2 blanked before, bit3 handled, bit4 sleeper set,
+// bits 8-15 framebuffer index +0x1DC),
+// s2idle sleeps, slot +0x4004.
+struct Display13EDPBlankCall {uint32_t ms,state,current,eligible,action,flags,sleeps,slot;};
+static Display13EDPBlankCall display13EDPBlankCalls[32];
+static volatile uint32_t display13EDPBlankCallCount=0;
+static uint32_t display13EDPBlankLastCurrent=0,display13EDPBlankLastEligible=0,display13EDPBlankLastAction=0;
+static bool display13EDPBlankCallSerialize(void *,void *,OSSerialize *serializer) {
+ const uint32_t n=__atomic_load_n(&display13EDPBlankCallCount,__ATOMIC_ACQUIRE),first=n>32 ? n-32 : 0;
+ auto data=OSData::withCapacity(static_cast<unsigned int>((n-first)*sizeof(Display13EDPBlankCall)));if(!data)return false;
+ for(uint32_t i=first;i<n;++i)data->appendBytes(&display13EDPBlankCalls[i%32],sizeof(Display13EDPBlankCall));
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
  const bool sleeping=xePmS2idleSleeping();
+ const uint32_t sleeps=xePmS2idleSleeps();
+ const bool blankedBefore=fb && fb==display13EDPBlankedFB && display13EDPBlankState.blanked;
+ const bool slept=blankedBefore && sleeps!=display13EDPBlankSleepMark;
  const bool handled=display13EDPBlankPowerImpl(fb,state,result);
  auto &r=display13EDPS2Record;bool changed=false;
+ auto stop=reinterpret_cast<void (*)(IOService *)>(display13FBStopTransactions);
+ auto setup=reinterpret_cast<void (*)(IOService *,uint32_t)>(display13FBSetupTransactions);
+ auto restore=reinterpret_cast<void (*)(IOService *,bool)>(display13FBRestoreTransactions);
  if(handled && fb && fb->metaCast("IOFramebuffer")) {
   if(sleeping && state<Display13EDPBlank::Wake && !display13EDPS2Sleeping) {
-   display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;
-   if(display13FBStopTransactions)reinterpret_cast<void (*)(IOService *)>(display13FBStopTransactions)(fb);
+   display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;display13EDPS2Stopped=false;
+   if(stop){stop(fb);display13EDPS2Stopped=true;}
    r[12]=Display13FBMemory::field<uint32_t>(fb,0x4004);
    r[1]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOff,nullptr);
    r[2]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOff,nullptr);
    r[3]=state;++r[11];changed=true;
-  } else if(fb==display13EDPS2Sleeping && state>=1) {
+  } else if(state>=1 && (fb==display13EDPS2Sleeping || (slept && !display13EDPS2Sleeping))) {
+   if(!display13EDPS2Sleeping) {
+    // The system slept while this panel was already blanked and no request reached
+    // us inside the sleep window: adopt its wake now (no sleep-side bookends sent).
+    display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;display13EDPS2Stopped=false;++r[16];
+   }
    if(!display13EDPS2DidWakeSent) {
     r[4]=Display13FBEventAccess::send(fb,kIOFBNotifyDidWake,reinterpret_cast<void *>(1));
     display13EDPS2DidWakeSent=true;
@@ -9483,21 +9517,35 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
     r[5]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOn,nullptr);
     r[6]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOn,nullptr);
     r[13]=Display13FBMemory::field<uint32_t>(fb,0x4004);
-    if(display13FBRestoreTransactions) {
-     reinterpret_cast<void (*)(IOService *,uint32_t)>(display13FBSetupTransactions)(fb,1);
-     reinterpret_cast<void (*)(IOService *,bool)>(display13FBRestoreTransactions)(fb,true);
+    if(restore) {
+     // Donor display wake order (prepareToExitWake stop ... prepareToEnterWake
+     // setupInitialTransactionState(1), RestoreTransactions(true)): an adopted wake
+     // drains in-flight transactions first, as the donor's display sleep would have.
+     if(!display13EDPS2Stopped)stop(fb);
+     setup(fb,1);restore(fb,true);
     }
-    r[7]=display13FBRestoreTransactions!=0;
+    r[7]=restore!=nullptr;
     r[14]=Display13FBMemory::field<uint32_t>(fb,0x4004);r[15]=Display13FBMemory::field<uint32_t>(fb,0x4008);
-    display13EDPS2Sleeping=nullptr;
+    display13EDPS2Sleeping=nullptr;display13EDPS2Stopped=false;display13EDPBlankSleepMark=sleeps;
    }
-   r[8]=state;r[9]=gWEXFBHandleEvent!=0;r[10]=display13FBStopTransactions!=0;++r[11];changed=true;
+   r[8]=state;r[9]=gWEXFBHandleEvent!=0;r[10]=restore!=nullptr;r[17]=sleeps;++r[11];changed=true;
+  }
+ }
+ if(fb && fb->getMetaClass()->getClassSize()>=0x4B90) {
+  const uint32_t n=__atomic_add_fetch(&display13EDPBlankCallCount,1,__ATOMIC_ACQ_REL);
+  display13EDPBlankCalls[(n-1)%32]={static_cast<uint32_t>(WEXTCDiag::uptimeMs()),state,display13EDPBlankLastCurrent,
+   display13EDPBlankLastEligible,display13EDPBlankLastAction,
+   (sleeping?1U:0U)|(slept?2U:0U)|(blankedBefore?4U:0U)|(handled?8U:0U)|(display13EDPS2Sleeping?16U:0U)|
+   ((Display13FBMemory::field<uint32_t>(fb,0x1DC)&0xFFU)<<8),
+   sleeps,Display13FBMemory::field<uint32_t>(fb,0x4004)};
+  static bool published=false;
+  if(!published)if(auto s=OSSerializer::forTarget(nullptr,display13EDPBlankCallSerialize)) {
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankCalls",s);s->release();published=true;
   }
  }
  if(changed)IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPS2Wake",r,sizeof(r));
  return handled;
 }
-static IOService *display13EDPBlankedFB=nullptr;
 bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &result) {
  namespace B=Display13EDPBlank;
  if(!display13EDPBlankActive)return false;
@@ -9512,19 +9560,21 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
    Display13FBMemory::field<void *>(fb,0x1D0)==c.controller && Display13FBMemory::boundPipe(c.pipe,fb)==0;
   // During an s2idle system sleep the donor may release FB0's scanout binding
   // while the panel is blanked; the framebuffer we blanked stays ours to wake.
-  if(!eligible && mapped && b.blanked && fb==display13EDPBlankedFB && (xePmS2idleSleeping() || fb==display13EDPS2Sleeping))eligible=true;
+  if(!eligible && mapped && b.blanked && fb==display13EDPBlankedFB &&
+   (xePmS2idleSleeping() || fb==display13EDPS2Sleeping || xePmS2idleSleeps()!=display13EDPBlankSleepMark))eligible=true;
   action=mapped ? B::decide(eligible,current,state,b.blanked) : B::Action::Native;
   struct IO {
    uintptr_t base;
    uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {base};
-  if(action==B::Action::Blank){B::blank(io,b);display13EDPBlankedFB=fb;}
+  if(action==B::Action::Blank){B::blank(io,b);display13EDPBlankedFB=fb;display13EDPBlankSleepMark=xePmS2idleSleeps();}
   else if(action==B::Action::Unblank)B::unblank(io,b);
   if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
   IOLockUnlock(c.lock);
  }
  // version, requested, previous, eligible, action, blanks, unblanks, plane, cursor
+ display13EDPBlankLastCurrent=current;display13EDPBlankLastEligible=eligible;display13EDPBlankLastAction=static_cast<uint32_t>(action);
  const uint32_t record[9]={2,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor};
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
  if(eligible && action!=B::Action::Native){result=kIOReturnSuccess;return true;}
