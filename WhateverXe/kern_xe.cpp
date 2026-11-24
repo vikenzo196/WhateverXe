@@ -9464,35 +9464,55 @@ static IOService *display13EDPS2Sleeping=nullptr; // FB blanked by an s2idle sys
 static bool display13EDPS2Stopped=false;
 static uint32_t display13EDPS2DidWakeAt=UINT32_MAX;
 static IOService *display13EDPBlankedFB=nullptr;
-// While the kept eDP is dark, donor register writes (AppleIntelRegisterAccessManager::WriteRegister32,
-// wrapDisplay13GMBusWrite) to pipe A plane 1 / cursor / PIPE_MISC lose their enable bits before they
-// reach the hardware: after an s2idle wake the donor re-enables the plane several times while its
-// gamma is still being rebuilt, and undoing it afterwards lets a wrong-colour (cyan) frame through.
-// What the donor asked for is kept here and applied at unblank (bit31 plane, bit4 dither, low
-// bits cursor mode, bit30 = cursor mode recorded).
+// Donor register writes go through AppleIntelRegisterAccessManager::WriteRegister32
+// (wrapDisplay13GMBusWrite). Two adjustments on pipe A, never on the plane/cursor enables (a
+// flip on a disabled plane never completes: IOAccelDisplayPipe's queue fills and WindowServer
+// blocks in wait_for_queue_slot_gated):
+// - while the kept eDP is dark, PIPE_MISC loses its dithering bit (kept for unblank);
+// - while it is "hidden" after an s2idle wake, plane 1 keeps a constant alpha of 0
+//   (PLANE_KEYMSK bit31 alpha enable, PLANE_KEYMAX alpha byte 0, as i915's plane alpha): the
+//   plane scans out and its flips complete, but only the black pipe background shows while the
+//   donor rebuilds the gamma (cyan frames otherwise). The donor's own values are kept.
+static constexpr uint32_t display13EDPKeyMsk=0x70198,display13EDPKeyMax=0x701A0;
 static volatile uint32_t display13EDPDarkWants=0,display13EDPDarkFiltered=0;
+static volatile bool display13EDPHidden=false;
+static volatile uint32_t display13EDPHiddenKeyMsk=0,display13EDPHiddenKeyMax=0;
 static inline uint32_t display13EDPDarkFilter(void *access,uint64_t reg,uint32_t value) {
  namespace B=Display13EDPBlank;
- if(reg!=B::PlaneCtl && reg!=B::PipeMisc && reg!=B::CurCtl)return value;
- if(!display13EDPBlankState.blanked || !display13EDPBlankedFB || !access || access!=display13FBPower.access)return value;
- uint32_t want=0;
- if(reg==B::PlaneCtl && (value&B::PlaneEnable)){want=B::PlaneEnable;value&=~B::PlaneEnable;}
- else if(reg==B::PipeMisc && (value&B::PipeDither)){want=B::PipeDither;value&=~B::PipeDither;}
- else if(reg==B::CurCtl && (value&B::CursorMode)) {
-  uint32_t old=__atomic_load_n(&display13EDPDarkWants,__ATOMIC_RELAXED),neu;
-  do neu=(old&~B::CursorMode)|(value&B::CursorMode)|0x40000000U;
-  while(!__atomic_compare_exchange_n(&display13EDPDarkWants,&old,neu,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED));
-  value&=~B::CursorMode;__atomic_add_fetch(&display13EDPDarkFiltered,1,__ATOMIC_RELAXED);return value;
+ if(reg!=B::PipeMisc && reg!=display13EDPKeyMsk && reg!=display13EDPKeyMax)return value;
+ if(!display13EDPBlankedFB || !access || access!=display13FBPower.access)return value;
+ if(reg==B::PipeMisc) {
+  if(display13EDPBlankState.blanked && (value&B::PipeDither)) {
+   __atomic_or_fetch(&display13EDPDarkWants,B::PipeDither,__ATOMIC_ACQ_REL);value&=~B::PipeDither;
+   __atomic_add_fetch(&display13EDPDarkFiltered,1,__ATOMIC_RELAXED);
+  }
+  return value;
  }
- if(want){__atomic_or_fetch(&display13EDPDarkWants,want,__ATOMIC_ACQ_REL);__atomic_add_fetch(&display13EDPDarkFiltered,1,__ATOMIC_RELAXED);}
- return value;
+ if(!__atomic_load_n(&display13EDPHidden,__ATOMIC_ACQUIRE))return value;
+ __atomic_add_fetch(&display13EDPDarkFiltered,1,__ATOMIC_RELAXED);
+ if(reg==display13EDPKeyMsk){__atomic_store_n(&display13EDPHiddenKeyMsk,value,__ATOMIC_RELEASE);return value|0x80000000U;}
+ __atomic_store_n(&display13EDPHiddenKeyMax,value,__ATOMIC_RELEASE);return value&0x00FFFFFFU;
 }
 template<class IO> static void display13EDPUnblankFolded(IO &io,Display13EDPBlank::State &b) {
  namespace B=Display13EDPBlank;
  const uint32_t w=__atomic_exchange_n(&display13EDPDarkWants,0U,__ATOMIC_ACQ_REL);
- b.plane|=w&B::PlaneEnable;b.misc|=w&B::PipeDither;
- if(w&0x40000000U)b.cursor=(b.cursor&~B::CursorMode)|(w&B::CursorMode);
+ b.misc|=w&B::PipeDither;
  B::unblank(io,b);
+}
+// Hide/show plane 1 of pipe A with its constant alpha (latched by the PLANE_SURF write).
+template<class IO> static void display13EDPHide(IO &io) {
+ __atomic_store_n(&display13EDPHiddenKeyMsk,io.read(display13EDPKeyMsk),__ATOMIC_RELEASE);
+ __atomic_store_n(&display13EDPHiddenKeyMax,io.read(display13EDPKeyMax),__ATOMIC_RELEASE);
+ __atomic_store_n(&display13EDPHidden,true,__ATOMIC_RELEASE);
+ io.write(display13EDPKeyMsk,display13EDPHiddenKeyMsk|0x80000000U);
+ io.write(display13EDPKeyMax,display13EDPHiddenKeyMax&0x00FFFFFFU);
+ io.write(Display13EDPBlank::PlaneSurf,io.read(Display13EDPBlank::PlaneSurf));
+}
+template<class IO> static void display13EDPShow(IO &io) {
+ if(!__atomic_exchange_n(&display13EDPHidden,false,__ATOMIC_ACQ_REL))return;
+ io.write(display13EDPKeyMsk,__atomic_load_n(&display13EDPHiddenKeyMsk,__ATOMIC_ACQUIRE));
+ io.write(display13EDPKeyMax,__atomic_load_n(&display13EDPHiddenKeyMax,__ATOMIC_ACQUIRE));
+ io.write(Display13EDPBlank::PlaneSurf,io.read(Display13EDPBlank::PlaneSurf));
 }
 // s2idle sleep count when the panel was blanked (or last woken from a system sleep).
 // A different count means a system sleep happened while it stayed blanked, whatever
@@ -9532,16 +9552,18 @@ static void display13EDPUnblankWork(thread_call_param_t,thread_call_param_t) {
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {c.map->getVirtualAddress()};
   const uint32_t tick=++display13EDPUnblankTicks;r[0]=tick;
-  if(!b.blanked || !fb){r[1]=3;r[2]=tick*5;display13EDPUnblankPending=false;}
-  else {
-   if(Display13EDPBlank::enforce(io,b))++r[3];
+  if(b.blanked || !fb || !__atomic_load_n(&display13EDPHidden,__ATOMIC_ACQUIRE)) {
+   // Blanked again (display sleep) or nothing hidden any more: just stop showing nothing.
+   r[1]=3;r[2]=tick*5;display13EDPUnblankPending=false;
+   if(!b.blanked)display13EDPShow(io);
+  } else {
    const uint32_t gamma=io.read(0x4A480);
    display13EDPUnblankStable=((gamma&0xC0000000U)==0xC0000000U && gamma!=UINT32_MAX) ? display13EDPUnblankStable+1 : 0;
    const bool ready=display13EDPUnblankStable>=6;
    if(ready || tick>=400) {
     r[1]=ready ? 1 : 2;r[2]=tick*5;r[4]=display13EDPBlankGamma;r[5]=gamma;
-    r[6]=Display13FBMemory::field<uint32_t>(fb,0x4284);
-    display13EDPUnblankFolded(io,b);++display13EDPUnblankDone;display13EDPUnblankPending=false;
+    r[6]=Display13FBMemory::field<uint32_t>(fb,0x4284);r[3]=display13EDPDarkFiltered;
+    display13EDPShow(io);++display13EDPUnblankDone;display13EDPUnblankPending=false;
    } else again=true;
   }
   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPUnblankWait",r,sizeof(r));
@@ -9688,6 +9710,7 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
   } io {base};
   if(action==B::Action::Blank) {
    __atomic_store_n(&display13EDPDarkWants,0U,__ATOMIC_RELEASE);
+   display13EDPShow(io);display13EDPUnblankPending=false;
    B::blank(io,b);display13EDPBlankedFB=fb;display13EDPBlankSleepMark=xePmS2idleSleeps();
    display13EDPBlankGamma=io.read(0x4A480);
   }
@@ -9699,6 +9722,7 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
    const bool s2wake=display13EDPUnblankCall && (xePmS2idleSleeping() || fb==display13EDPS2Sleeping ||
     xePmS2idleSleeps()!=display13EDPBlankSleepMark);
    if(s2wake) {
+    display13EDPHide(io);display13EDPUnblankFolded(io,b);
     display13EDPUnblankPending=true;++display13EDPUnblankDeferred;
     display13EDPUnblankTicks=0;display13EDPUnblankStable=0;
     for(auto &v:display13EDPUnblankRecord)v=0;
