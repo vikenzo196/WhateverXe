@@ -9455,7 +9455,9 @@ struct Display13FBEventAccess {
  }
 };
 static IOService *display13EDPS2Sleeping=nullptr; // FB blanked by an s2idle system sleep
-static bool display13EDPS2DidWakeSent=false,display13EDPS2Stopped=false;
+// IOFramebuffer clears pagingState at EVERY system sleep: DidWake is owed once per s2idle sleep.
+static bool display13EDPS2Stopped=false;
+static uint32_t display13EDPS2DidWakeAt=UINT32_MAX;
 static IOService *display13EDPBlankedFB=nullptr;
 // s2idle sleep count when the panel was blanked (or last woken from a system sleep).
 // A different count means a system sleep happened while it stayed blanked, whatever
@@ -9468,17 +9470,19 @@ static uint32_t display13EDPBlankSleepMark=0;
 // [9] handleEvent solved, [10] transaction trio solved, [11] count,
 // [12] slot +0x4004 after StopTransactions, [13] slot at wake before setup,
 // [14] slot after RestoreTransactions, [15] pending +0x4008 after RestoreTransactions,
-// [16] wakes adopted after the sleep window (no sleep-side bookends), [17] s2idle sleeps.
-static uint32_t display13EDPS2Record[18]={3};
+// [16] wakes adopted after the sleep window (no sleep-side bookends), [17] s2idle sleeps,
+// [18] display interrupt control 0x44200 at Wake, [19] fallback hwEnableInterrupts result (0xFFFFFFFF none).
+static uint32_t display13EDPS2Record[20]={4};
 // Fork diagnostic: the last 32 eDP blank power calls, oldest first in the serializer.
 // Per call: uptime ms, requested, donor current, eligible, action, flags (bit0 window
 // open, bit1 slept since blank, bit2 blanked before, bit3 handled, bit4 sleeper set,
 // bits 8-15 framebuffer index +0x1DC),
-// s2idle sleeps, slot +0x4004.
-struct Display13EDPBlankCall {uint32_t ms,state,current,eligible,action,flags,sleeps,slot;};
+// s2idle sleeps, slot +0x4004, display interrupt control 0x44200 (flags bit5: FB0 held at Sleep).
+struct Display13EDPBlankCall {uint32_t ms,state,current,eligible,action,flags,sleeps,slot,irq;};
 static Display13EDPBlankCall display13EDPBlankCalls[32];
 static volatile uint32_t display13EDPBlankCallCount=0;
-static uint32_t display13EDPBlankLastCurrent=0,display13EDPBlankLastEligible=0,display13EDPBlankLastAction=0;
+static uint32_t display13EDPBlankLastCurrent=0,display13EDPBlankLastEligible=0,display13EDPBlankLastAction=0,display13EDPBlankLastIrq=0;
+static bool display13EDPBlankLastHold=false;
 static bool display13EDPBlankCallSerialize(void *,void *,OSSerialize *serializer) {
  const uint32_t n=__atomic_load_n(&display13EDPBlankCallCount,__ATOMIC_ACQUIRE),first=n>32 ? n-32 : 0;
  auto data=OSData::withCapacity(static_cast<unsigned int>((n-first)*sizeof(Display13EDPBlankCall)));if(!data)return false;
@@ -9497,7 +9501,7 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
  auto restore=reinterpret_cast<void (*)(IOService *,bool)>(display13FBRestoreTransactions);
  if(handled && fb && fb->metaCast("IOFramebuffer")) {
   if(sleeping && state<Display13EDPBlank::Wake && !display13EDPS2Sleeping) {
-   display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;display13EDPS2Stopped=false;
+   display13EDPS2Sleeping=fb;display13EDPS2Stopped=false;
    if(stop){stop(fb);display13EDPS2Stopped=true;}
    r[12]=Display13FBMemory::field<uint32_t>(fb,0x4004);
    r[1]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOff,nullptr);
@@ -9507,13 +9511,21 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
    if(!display13EDPS2Sleeping) {
     // The system slept while this panel was already blanked and no request reached
     // us inside the sleep window: adopt its wake now (no sleep-side bookends sent).
-    display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;display13EDPS2Stopped=false;++r[16];
+    display13EDPS2Sleeping=fb;display13EDPS2Stopped=false;++r[16];
    }
-   if(!display13EDPS2DidWakeSent) {
+   if(display13EDPS2DidWakeAt!=sleeps) {
     r[4]=Display13FBEventAccess::send(fb,kIOFBNotifyDidWake,reinterpret_cast<void *>(1));
-    display13EDPS2DidWakeSent=true;
+    display13EDPS2DidWakeAt=sleeps;
    }
    if(state==Display13EDPBlank::Wake) {
+    // FB0 was held at Sleep through the dark wake so the next native framebuffer ran the
+    // controller restore (hwEnableInterrupts among it). If none did, the display interrupt
+    // master is still off: no flip completion ever reaches IOAccelDisplayPipe. Run the same
+    // (fork-owned) hwEnableInterrupts the donor's prepareToExitSleep would have run.
+    auto &c=display13FBPower;
+    r[18]=c.map && c.map->getVirtualAddress() ? *reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+0x44200) : UINT32_MAX;
+    r[19]=UINT32_MAX;
+    if(r[18]==0)if(auto controller=Display13FBMemory::field<IOService *>(fb,0x1D0))r[19]=wrapDisplay13FBEnableIRQ(controller);
     r[5]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOn,nullptr);
     r[6]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOn,nullptr);
     r[13]=Display13FBMemory::field<uint32_t>(fb,0x4004);
@@ -9535,9 +9547,9 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
   const uint32_t n=__atomic_add_fetch(&display13EDPBlankCallCount,1,__ATOMIC_ACQ_REL);
   display13EDPBlankCalls[(n-1)%32]={static_cast<uint32_t>(WEXTCDiag::uptimeMs()),state,display13EDPBlankLastCurrent,
    display13EDPBlankLastEligible,display13EDPBlankLastAction,
-   (sleeping?1U:0U)|(slept?2U:0U)|(blankedBefore?4U:0U)|(handled?8U:0U)|(display13EDPS2Sleeping?16U:0U)|
+   (sleeping?1U:0U)|(slept?2U:0U)|(blankedBefore?4U:0U)|(handled?8U:0U)|(display13EDPS2Sleeping?16U:0U)|(display13EDPBlankLastHold?32U:0U)|
    ((Display13FBMemory::field<uint32_t>(fb,0x1DC)&0xFFU)<<8),
-   sleeps,Display13FBMemory::field<uint32_t>(fb,0x4004)};
+   sleeps,Display13FBMemory::field<uint32_t>(fb,0x4004),display13EDPBlankLastIrq};
   static bool published=false;
   if(!published)if(auto s=OSSerializer::forTarget(nullptr,display13EDPBlankCallSerialize)) {
    IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlankCalls",s);s->release();published=true;
@@ -9570,7 +9582,16 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
   } io {base};
   if(action==B::Action::Blank){B::blank(io,b);display13EDPBlankedFB=fb;display13EDPBlankSleepMark=xePmS2idleSleeps();}
   else if(action==B::Action::Unblank)B::unblank(io,b);
-  if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
+  // The donor's last framebuffer to enter Sleep saves the controller and disables the display
+  // interrupts (prepareToEnterSleep: hwSaveState, hwDisableInterrupts -> 0x44200=0, when every
+  // other FB is at 0); the first one to leave Sleep restores them (prepareToExitSleep:
+  // restorePowerWellsState, hwEnableInterrupts, hwInitializeCState, hwRestoreState) only if every
+  // other FB is still at 0. FB0 is asked first: while the controller is still saved, keep its
+  // donor state at Sleep through the dark-wake Doze so the next native framebuffer restores it.
+  const uint32_t irq=io.read(0x44200);
+  const bool hold=eligible && action!=B::Action::Native && state<B::Wake && current==0 && irq==0;
+  display13EDPBlankLastIrq=irq;display13EDPBlankLastHold=hold;
+  if(eligible && action!=B::Action::Native && !hold)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
   IOLockUnlock(c.lock);
  }
  // version, requested, previous, eligible, action, blanks, unblanks, plane, cursor
