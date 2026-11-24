@@ -9413,7 +9413,7 @@ bool XE::display13EDPBlankActive=false;
 // on the same function: it only validates the donor entry and enables the
 // blank decision, which wrapDisplay13SetPowerState consults first for non-DSI
 // framebuffers (display13EDPBlankPower).
-static mach_vm_address_t display13FBStopTransactions=0,display13FBRestoreTransactions=0;
+static mach_vm_address_t display13FBStopTransactions=0,display13FBRestoreTransactions=0,display13FBSetupTransactions=0;
 bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  display13EDPBlankActive=false;
  if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;
@@ -9425,8 +9425,14 @@ bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_ad
  // system sleep (local symbols of the same exact image as setFramebufferPowerState).
  display13FBStopTransactions=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer16StopTransactionsEv",address,size);patcher.clearError();
  display13FBRestoreTransactions=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer19RestoreTransactionsEb",address,size);patcher.clearError();
- if(display13FBStopTransactions!=address+0x38B12)display13FBStopTransactions=0;
- if(display13FBRestoreTransactions!=address+0x33E4E)display13FBRestoreTransactions=0;
+ display13FBSetupTransactions=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer28setupInitialTransactionStateEj",address,size);patcher.clearError();
+ // StopTransactions parks the transaction slot (+0x4004) at -2, and PerformFlipTransaction
+ // refuses every flip while it is there; only setupInitialTransactionState(1) clears it
+ // (the donor's prepareToEnterWake calls it right before RestoreTransactions). Never stop
+ // without the means to restart: all three or none.
+ if(display13FBStopTransactions!=address+0x38B12 || display13FBRestoreTransactions!=address+0x33E4E ||
+  display13FBSetupTransactions!=address+0x318E8)
+  display13FBStopTransactions=display13FBRestoreTransactions=display13FBSetupTransactions=0;
  return true;
 }
 // Returns true when the kept eDP transition was handled here (result set);
@@ -9438,7 +9444,9 @@ bool xePmS2idleSleeping();
 // wake (link teardown/retrain), so during an s2idle system sleep replay the
 // donor's own bookends around the blank: at sleep StopTransactions, WillPowerOff
 // and DidPowerOff; at the first wake request DidWake; at Wake WillPowerOn,
-// DidPowerOn and RestoreTransactions(true) (last flip, colour pipeline, gamma).
+// DidPowerOn, setupInitialTransactionState(1) (reopens the transaction slot that
+// StopTransactions parked) and RestoreTransactions(true) (last flip, colour
+// pipeline, gamma), the donor's prepareToEnterWake order.
 extern mach_vm_address_t gWEXFBHandleEvent; // kern_xe host, solved when IOGraphicsFamily loads
 struct Display13FBEventAccess {
  static IOReturn send(IOService *fb,IOIndex event,void *info) {
@@ -9448,7 +9456,12 @@ struct Display13FBEventAccess {
 };
 static IOService *display13EDPS2Sleeping=nullptr; // FB blanked by an s2idle system sleep
 static bool display13EDPS2DidWakeSent=false;
-static uint32_t display13EDPS2Record[12]={1};
+// [0] version, [1] WillPowerOff, [2] DidPowerOff, [3] state at sleep, [4] DidWake,
+// [5] WillPowerOn, [6] DidPowerOn, [7] transactions restored, [8] last state,
+// [9] handleEvent solved, [10] transaction trio solved, [11] count,
+// [12] slot +0x4004 after StopTransactions, [13] slot at wake before setup,
+// [14] slot after RestoreTransactions, [15] pending +0x4008 after RestoreTransactions.
+static uint32_t display13EDPS2Record[16]={2};
 bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
  const bool sleeping=xePmS2idleSleeping();
  const bool handled=display13EDPBlankPowerImpl(fb,state,result);
@@ -9457,6 +9470,7 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
   if(sleeping && state<Display13EDPBlank::Wake && !display13EDPS2Sleeping) {
    display13EDPS2Sleeping=fb;display13EDPS2DidWakeSent=false;
    if(display13FBStopTransactions)reinterpret_cast<void (*)(IOService *)>(display13FBStopTransactions)(fb);
+   r[12]=Display13FBMemory::field<uint32_t>(fb,0x4004);
    r[1]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOff,nullptr);
    r[2]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOff,nullptr);
    r[3]=state;++r[11];changed=true;
@@ -9468,8 +9482,13 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
    if(state==Display13EDPBlank::Wake) {
     r[5]=Display13FBEventAccess::send(fb,kIOFBNotifyWillPowerOn,nullptr);
     r[6]=Display13FBEventAccess::send(fb,kIOFBNotifyDidPowerOn,nullptr);
-    if(display13FBRestoreTransactions)reinterpret_cast<void (*)(IOService *,bool)>(display13FBRestoreTransactions)(fb,true);
+    r[13]=Display13FBMemory::field<uint32_t>(fb,0x4004);
+    if(display13FBRestoreTransactions) {
+     reinterpret_cast<void (*)(IOService *,uint32_t)>(display13FBSetupTransactions)(fb,1);
+     reinterpret_cast<void (*)(IOService *,bool)>(display13FBRestoreTransactions)(fb,true);
+    }
     r[7]=display13FBRestoreTransactions!=0;
+    r[14]=Display13FBMemory::field<uint32_t>(fb,0x4004);r[15]=Display13FBMemory::field<uint32_t>(fb,0x4008);
     display13EDPS2Sleeping=nullptr;
    }
    r[8]=state;r[9]=gWEXFBHandleEvent!=0;r[10]=display13FBStopTransactions!=0;++r[11];changed=true;
