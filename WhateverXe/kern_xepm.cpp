@@ -301,6 +301,147 @@ static IOReturn xpSleepInterest(void *, void *, UInt32 type, IOService *, void *
 	return kIOReturnSuccess;
 }
 uint32_t xePmS2idleSleeps() { return __atomic_load_n(&gXpSleepCount, __ATOMIC_ACQUIRE); }
+// ─── MWAIT wait machinery (tested at runtime by debug.xepm.mwtest, used by the sleep wait with s2wait 2) ─────────
+// The TPAUSE wait is C0, so the package stays in PC0 (~2.9 W). For a deep MWAIT the core needs a wake event: the
+// LAPIC timer in TSC deadline mode, pointed at vector 0xF2 of a copy of the kernel's IDT (gate: EOI + iretq), with
+// the task priority at 0xE0 so that no kernel vector (<= 0xDF) can be delivered. xAPIC (MMIO page) or x2APIC (MSRs).
+extern "C" {
+__attribute__((used)) volatile uint32_t gXpMwIrq = 0;
+__attribute__((used)) volatile uint64_t gXpMwEoi = 0;   // xAPIC: virtual address of the EOI register; 0: x2APIC
+void xpMwStub();
+void xpMwSpur();
+}
+asm(R"(
+	.section __TEXT,__text,regular,pure_instructions
+	.p2align 4
+	.private_extern _xpMwStub
+_xpMwStub:
+	.byte 0xf3, 0x0f, 0x1e, 0xfa
+	pushq %rax
+	pushq %rcx
+	pushq %rdx
+	lock incl _gXpMwIrq(%rip)
+	movq _gXpMwEoi(%rip), %rax
+	testq %rax, %rax
+	jz 1f
+	movl $0, (%rax)
+	jmp 2f
+1:
+	movl $0x80B, %ecx
+	xorl %eax, %eax
+	xorl %edx, %edx
+	wrmsr
+2:
+	popq %rdx
+	popq %rcx
+	popq %rax
+	iretq
+	.p2align 4
+	.private_extern _xpMwSpur
+_xpMwSpur:
+	.byte 0xf3, 0x0f, 0x1e, 0xfa
+	iretq
+)");
+static constexpr uint8_t xpMwVector = 0xF2, xpMwSpurious = 0xFF;
+alignas(4096) static uint8_t gXpMwIdt[4096];
+alignas(64) static volatile uint64_t gXpMwMonitor[8];
+static IOMemoryMap *gXpMwApicMap = nullptr;
+static volatile uint32_t *gXpMwApic = nullptr;   // xAPIC MMIO page; nullptr: x2APIC MSRs
+static inline uint32_t xpApicRd(unsigned off) { return gXpMwApic ? gXpMwApic[off / 4] : (uint32_t)xpRdmsr(0x800 + off / 16); }
+static inline void xpApicWr(unsigned off, uint32_t v) { if (gXpMwApic) gXpMwApic[off / 4] = v; else xpWrmsr(0x800 + off / 16, v); }
+struct __attribute__((packed)) XpIdtr { uint16_t limit; uint64_t base; };
+static void xpMwGate(uint8_t vec, uint64_t h, uint16_t cs) {
+	uint8_t *g = gXpMwIdt + vec * 16;
+	g[0] = (uint8_t)h; g[1] = (uint8_t)(h >> 8); g[2] = (uint8_t)cs; g[3] = (uint8_t)(cs >> 8);
+	g[4] = 0; g[5] = 0x8E;   // IST 0; present, DPL 0, 64-bit interrupt gate
+	g[6] = (uint8_t)(h >> 16); g[7] = (uint8_t)(h >> 24);
+	for (unsigned i = 0; i < 4; i++) g[8 + i] = (uint8_t)(h >> (32 + 8 * i));
+	g[12] = g[13] = g[14] = g[15] = 0;
+}
+// XNU sets the IDT limit to 0x1000 + the CPU number (sidt gives user code its CPU number): the 256 gates are the
+// first 4096 bytes; callers keep the limit as it is.
+static void xpMwBuildIdt(const XpIdtr &kidt) {
+	memcpy(gXpMwIdt, reinterpret_cast<const void *>(kidt.base), sizeof(gXpMwIdt));
+	uint16_t cs;
+	asm volatile("mov %%cs, %0" : "=r"(cs));
+	xpMwGate(xpMwVector, reinterpret_cast<uint64_t>(&xpMwStub), cs);
+	xpMwGate(xpMwSpurious, reinterpret_cast<uint64_t>(&xpMwSpur), cs);
+}
+// Done at runtime (sysctl s2wait=2): the CPU features the wait needs (MWAIT, TSC deadline timer, an APIC timer that
+// keeps running in deep C-states: ARAT) and the APIC page mapping, which cannot be made in the sleep callback.
+static bool gXpMwReady = false;
+static int xpMwPrepare() {
+	uint32_t a = 1, b, c = 0, d;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+	const bool hasMwait = (c >> 3) & 1, hasDl = (c >> 24) & 1;
+	a = 6; c = 0;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+	const bool arat = (a >> 2) & 1;
+	if (!hasMwait || !hasDl || !arat) return ENOTSUP;
+	const uint64_t apic = xpRdmsr(0x1B);
+	if (!(apic & 0x800)) return ENXIO;
+	const bool x2 = (apic & 0x400) != 0;
+	if (!x2 && !gXpMwApicMap) {
+		if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(apic & 0xFFFFFF000ULL, 0x1000, kIODirectionInOut)) {
+			gXpMwApicMap = md->map(kIOMapInhibitCache);
+			md->release();
+		}
+		if (!gXpMwApicMap) return ENOMEM;
+	}
+	gXpMwApic = x2 ? nullptr : reinterpret_cast<volatile uint32_t *>(gXpMwApicMap->getVirtualAddress());
+	gXpMwEoi = x2 ? 0 : reinterpret_cast<uint64_t>(gXpMwApic) + 0xB0;
+	gXpMwReady = true;
+	return 0;
+}
+// Sleep wait (interrupts off, other CPUs off). acpi_sleep_kernel has run lapic_shutdown: timer/LINT0/error/perf LVTs
+// masked, software disabled, possibly globally disabled (APIC_BASE enable clear). The APIC is enabled in the mode it
+// was prepared in, the timer LVT pointed at 0xF2, everything else left as found; xpMwLeave puts back the exact state.
+struct XpMwSave { XpIdtr kidt; uint64_t apicBase, dl; uint32_t svr, lvt, tpr; };
+static uint64_t gXpMwFoundBase = 0;
+static uint32_t gXpMwFoundSvr = 0, gXpMwFail = 0;
+static bool xpMwEnter(XpMwSave &s) {
+	s.apicBase = xpRdmsr(0x1B);
+	gXpMwFoundBase = s.apicBase;
+	const bool x2 = gXpMwApic == nullptr;
+	if (s.apicBase & 0x800) {
+		if (((s.apicBase & 0x400) != 0) != x2) { gXpMwFail = 1; return false; }
+	} else {
+		xpWrmsr(0x1B, (s.apicBase | 0x800) & ~0x400ULL);   // disabled -> xAPIC (-> x2APIC)
+		if (x2) xpWrmsr(0x1B, s.apicBase | 0xC00);
+	}
+	asm volatile("sidt %0" : "=m"(s.kidt));
+	if ((size_t)s.kidt.limit + 1 < sizeof(gXpMwIdt)) {
+		if (xpRdmsr(0x1B) != s.apicBase) xpWrmsr(0x1B, s.apicBase);
+		gXpMwFail = 2;
+		return false;
+	}
+	s.svr = xpApicRd(0xF0);
+	s.lvt = xpApicRd(0x320);
+	s.tpr = xpApicRd(0x80);
+	s.dl = xpRdmsr(0x6E0);
+	gXpMwFoundSvr = s.svr;
+	xpMwBuildIdt(s.kidt);
+	XpIdtr ours {s.kidt.limit, reinterpret_cast<uint64_t>(gXpMwIdt)};
+	asm volatile("lidt %0" : : "m"(ours) : "memory");
+	xpApicWr(0xF0, (s.svr & ~0xFFU) | 0x100U | xpMwSpurious);   // software enabled, spurious vector 0xFF
+	xpApicWr(0x80, 0xE0);
+	xpApicWr(0x320, (2U << 17) | xpMwVector);   // TSC deadline mode, unmasked
+	gXpMwFail = 0;
+	return true;
+}
+static void xpMwLeave(const XpMwSave &s) {
+	xpWrmsr(0x6E0, 0);
+	asm volatile("sti\n\tnop\n\tnop\n\tcli" : : : "memory");   // a deadline that fired after the last cli lands here
+	xpApicWr(0x320, s.lvt);
+	xpApicWr(0x80, s.tpr);
+	xpApicWr(0xF0, s.svr);
+	asm volatile("lidt %0" : : "m"(s.kidt) : "memory");
+	if (s.dl) xpWrmsr(0x6E0, s.dl);
+	if (xpRdmsr(0x1B) != s.apicBase) xpWrmsr(0x1B, s.apicBase);
+}
+static int gXpSleepPeriodMs = 50;
+static uint32_t gXpMwSleepIrq = 0, gXpMwUsed = 0;
+static uint64_t gXpMwSleepC6 = 0, gXpMwSleepC7 = 0;
 static void xpFakeSleep(void *) {
 	uint8_t snap[xpGpe0Len];
 	// Only GPEs the OS armed for wake (GPE0_EN, 0x1870) may end the wait; others (EC chatter) are ignored.
@@ -337,6 +478,12 @@ static void xpFakeSleep(void *) {
 		}
 	}
 	gXpSleepHwp = hwpSet ? hwp : 0;
+	// s2wait 2: between polls the core sleeps in MWAIT C10 until the LAPIC timer (s2period ms) or another break event.
+	XpMwSave mws {};
+	const bool mw = wait == 2 && gXpMwReady && tpms && xpMwEnter(mws);
+	const uint64_t mwPeriod = tpms * (uint64_t)gXpSleepPeriodMs;
+	const uint32_t mwIrq0 = gXpMwIrq;
+	const uint64_t mc6 = mw && (mok & (1U << 11)) ? xpRdmsr(0x3FD) : 0, mc7 = mw && (mok & (1U << 12)) ? xpRdmsr(0x3FE) : 0;
 	while (!reason) {
 		const uint16_t pm1 = xpInw(xpPm1Sts);
 		if (pm1 & (1U << 8)) reason = 1;
@@ -359,11 +506,23 @@ static void xpFakeSleep(void *) {
 			}
 			snap[i] = g;
 		}
-		if (wait >= 1 && gXpWaitPkg == 1 && tpms) xpTpause(xpRdtsc() + tpms);   // ~1 ms
+		if (mw) {
+			if (reason) break;
+			xpWrmsr(0x6E0, xpRdtsc() + mwPeriod);
+			asm volatile(".byte 0x0f, 0x01, 0xc8" : : "a"(gXpMwMonitor), "c"(0U), "d"(0U) : "memory");   // MONITOR
+			asm volatile("sti\n\t.byte 0x0f, 0x01, 0xc9\n\tcli" : : "a"(0x60U), "c"(1U) : "memory");   // MWAIT C10
+		} else if (wait >= 1 && gXpWaitPkg == 1 && tpms) xpTpause(xpRdtsc() + tpms);   // ~1 ms
 		else for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
 		++loops;
 		if (!reason && safety && xpRdtsc() - t0 >= safety) reason = 3;
 	}
+	if (mw) {
+		gXpMwSleepIrq = gXpMwIrq - mwIrq0;
+		gXpMwSleepC6 = (mok & (1U << 11)) && tpms ? (xpRdmsr(0x3FD) - mc6) / tpms : 0;
+		gXpMwSleepC7 = (mok & (1U << 12)) && tpms ? (xpRdmsr(0x3FE) - mc7) / tpms : 0;
+		xpMwLeave(mws);
+	}
+	gXpMwUsed = mw ? 1 : (wait == 2 ? 2 : 0);   // 2: asked for, not entered (see mwfail)
 	if (hwpSet) xpWrmsr(0x774, hwp);
 	{
 		const uint64_t t1 = xpRdtsc(), e1 = xpRdmsr(0x611) & 0xFFFFFFFFULL, c1 = xpRdmsr(0x639) & 0xFFFFFFFFULL;
@@ -419,8 +578,20 @@ static int xpSleepWaitHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 	int value = gXpSleepWait;
 	const int error = sysctl_handle_int(oidp, &value, 0, req);
 	if (error || !req->newptr) return error;
-	if (value < 0 || value > 1) return EINVAL;
+	if (value < 0 || value > 2) return EINVAL;
+	if (value == 2) {
+		xpCalibrate();
+		if (const int e = xpMwPrepare()) return e;
+	}
 	gXpSleepWait = value;
+	return 0;
+}
+static int xpSleepPeriodHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = gXpSleepPeriodMs;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 5 || value > 1000) return EINVAL;
+	gXpSleepPeriodMs = value;
 	return 0;
 }
 static int xpSleepSafetyHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
@@ -431,7 +602,7 @@ static int xpSleepSafetyHandler(struct sysctl_oid *oidp, void *, int, struct sys
 	gXpSleepSafety = value;
 	return 0;
 }
-static char gXpSleepText[720];
+static char gXpSleepText[960];
 static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[40]; size_t u = 0;
 	for (unsigned i = 0; i < 16 && u + 3 < sizeof(en); i++) u += snprintf(en + u, sizeof(en) - u, "%02x", gXpGpeEn[i]);
@@ -439,18 +610,21 @@ static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 		" wait=%d waitpkg=%d safety=%d tsc_ms=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx"
 		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u"
 		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u pp1_mw=%llu psys_mw=%llu pkgcst=0x%llx msrok=0x%x"
-		" rc6=%u gtcore=0x%x/0x%x trans=0x%x plane=0x%x dc=0x%x pwell=0x%x pipemisc=0x%x",
+		" rc6=%u gtcore=0x%x/0x%x trans=0x%x plane=0x%x dc=0x%x pwell=0x%x pipemisc=0x%x"
+		" mw=%u period_ms=%d mwirq=%u mw_c6_ms=%llu mw_c7_ms=%llu apic_found=0x%llx svr_found=0x%x mwfail=%u",
 		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
 		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp,
 		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3], gXpUserWakeCount,
 		gXpResPm[0], gXpResPm[1], gXpResPm[2], gXpResPm[3], gXpResPm[4], gXpResPm[5], gXpResPm[6],
 		gXpPp1Mw, gXpPsysMw, gXpPkgCst, gXpMsrOk,
-		gXpRc6, gXpGtCore[0], gXpGtCore[1], gXpDisp[0], gXpDisp[1], gXpDisp[2], gXpDisp[3], gXpDisp[4]);
+		gXpRc6, gXpGtCore[0], gXpGtCore[1], gXpDisp[0], gXpDisp[1], gXpDisp[2], gXpDisp[3], gXpDisp[4],
+		gXpMwUsed, gXpSleepPeriodMs, gXpMwSleepIrq, gXpMwSleepC6, gXpMwSleepC7, gXpMwFoundBase, gXpMwFoundSvr, gXpMwFail);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2stat, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, xpSleepStatHandler, "A", "s2idle status");
-SYSCTL_PROC(_debug_xepm, OID_AUTO, s2wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepWaitHandler, "I", "s2idle wait: 0 spin, 1 low power");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, s2wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepWaitHandler, "I", "s2idle wait: 0 spin, 1 TPAUSE, 2 MWAIT + APIC timer");
+SYSCTL_PROC(_debug_xepm, OID_AUTO, s2period, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepPeriodHandler, "I", "s2wait 2: APIC timer period (ms)");
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepSafetyHandler, "I", "s2idle wake after N s (0 never)");
 
 // ─── 7: MWAIT wait test (runtime, opt-in) ──────────────────────────────────────────────────────────────────────
@@ -463,47 +637,8 @@ SYSCTL_PROC(_debug_xepm, OID_AUTO, s2safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 // (IDT, TPR, LVT timer, XNU's own deadline). The LAPIC is reached through its MMIO page in xAPIC mode (XNU's mode
 // here, APIC_BASE 0xFEE00800) or through MSRs in x2APIC mode. sysctl debug.xepm.mwtest=N (1..50) runs it,
 // debug.xepm.mwperiod sets the period in us (N * period <= 100 ms), debug.xepm.mwstat has the result.
-extern "C" {
-__attribute__((used)) volatile uint32_t gXpMwIrq = 0;
-__attribute__((used)) volatile uint64_t gXpMwEoi = 0;   // xAPIC: virtual address of the EOI register; 0: x2APIC
-void xpMwStub();
-}
-asm(R"(
-	.section __TEXT,__text,regular,pure_instructions
-	.p2align 4
-	.private_extern _xpMwStub
-_xpMwStub:
-	.byte 0xf3, 0x0f, 0x1e, 0xfa
-	pushq %rax
-	pushq %rcx
-	pushq %rdx
-	lock incl _gXpMwIrq(%rip)
-	movq _gXpMwEoi(%rip), %rax
-	testq %rax, %rax
-	jz 1f
-	movl $0, (%rax)
-	jmp 2f
-1:
-	movl $0x80B, %ecx
-	xorl %eax, %eax
-	xorl %edx, %edx
-	wrmsr
-2:
-	popq %rdx
-	popq %rcx
-	popq %rax
-	iretq
-)");
-static constexpr uint8_t xpMwVector = 0xF2;
-alignas(4096) static uint8_t gXpMwIdt[4096];
-alignas(64) static volatile uint64_t gXpMwMonitor[8];
 static int gXpMwPeriodUs = 2000, gXpMwLast = 0;
 static char gXpMwText[440];
-static IOMemoryMap *gXpMwApicMap = nullptr;
-static volatile uint32_t *gXpMwApic = nullptr;   // xAPIC MMIO page; nullptr: x2APIC MSRs
-static inline uint32_t xpApicRd(unsigned off) { return gXpMwApic ? gXpMwApic[off / 4] : (uint32_t)xpRdmsr(0x800 + off / 16); }
-static inline void xpApicWr(unsigned off, uint32_t v) { if (gXpMwApic) gXpMwApic[off / 4] = v; else xpWrmsr(0x800 + off / 16, v); }
-struct __attribute__((packed)) XpIdtr { uint16_t limit; uint64_t base; };
 static void xpMwTest(int iters) {
 	int code = 0;
 	uint64_t apic = 0, dl = 0, t0 = 0, t1 = 0, c6 = 0, c7 = 0, minUs = ~0ULL, maxUs = 0;
@@ -545,16 +680,7 @@ static void xpMwTest(int iters) {
 				apicId = x2 ? xpApicRd(0x20) : xpApicRd(0x20) >> 24;
 				tpr = xpApicRd(0x80);
 				dl = xpRdmsr(0x6E0);
-				memcpy(gXpMwIdt, reinterpret_cast<const void *>(kidt.base), sizeof(gXpMwIdt));
-				uint16_t cs;
-				asm volatile("mov %%cs, %0" : "=r"(cs));
-				const uint64_t h = reinterpret_cast<uint64_t>(&xpMwStub);
-				uint8_t *g = gXpMwIdt + xpMwVector * 16;
-				g[0] = (uint8_t)h; g[1] = (uint8_t)(h >> 8); g[2] = (uint8_t)cs; g[3] = (uint8_t)(cs >> 8);
-				g[4] = 0; g[5] = 0x8E;   // IST 0; present, DPL 0, 64-bit interrupt gate
-				g[6] = (uint8_t)(h >> 16); g[7] = (uint8_t)(h >> 24);
-				for (unsigned i = 0; i < 4; i++) g[8 + i] = (uint8_t)(h >> (32 + 8 * i));
-				g[12] = g[13] = g[14] = g[15] = 0;
+				xpMwBuildIdt(kidt);
 				XpIdtr ours {kidt.limit, reinterpret_cast<uint64_t>(gXpMwIdt)};
 				asm volatile("lidt %0" : : "m"(ours) : "memory");
 				xpApicWr(0x80, 0xE0);
@@ -676,6 +802,7 @@ void xePmInstall(KernelPatcher &patcher) {
 		sysctl_register_oid(&sysctl__debug_xepm_s2stat);
 		sysctl_register_oid(&sysctl__debug_xepm_s2wait);
 		sysctl_register_oid(&sysctl__debug_xepm_s2safety);
+		sysctl_register_oid(&sysctl__debug_xepm_s2period);
 		sysctl_register_oid(&sysctl__debug_xepm_mwtest);
 		sysctl_register_oid(&sysctl__debug_xepm_mwperiod);
 		sysctl_register_oid(&sysctl__debug_xepm_mwstat);
