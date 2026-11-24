@@ -460,10 +460,12 @@ SYSCTL_PROC(_debug_xepm, OID_AUTO, s2safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 // a copy of the kernel's IDT with one extra gate (vector 0xF2, EOI + iretq) is loaded, the task priority is raised
 // so that only vectors >= 0xF0 are delivered, the LAPIC timer (TSC deadline mode, as XNU programs it) is pointed
 // at 0xF2, and N times: deadline = now + period, then sti; MWAIT C10; cli. Everything is put back as it was
-// (IDT, TPR, LVT timer, XNU's own deadline). x2APIC mode only. sysctl debug.xepm.mwtest=N (1..50) runs it,
+// (IDT, TPR, LVT timer, XNU's own deadline). The LAPIC is reached through its MMIO page in xAPIC mode (XNU's mode
+// here, APIC_BASE 0xFEE00800) or through MSRs in x2APIC mode. sysctl debug.xepm.mwtest=N (1..50) runs it,
 // debug.xepm.mwperiod sets the period in us (N * period <= 100 ms), debug.xepm.mwstat has the result.
 extern "C" {
 __attribute__((used)) volatile uint32_t gXpMwIrq = 0;
+__attribute__((used)) volatile uint64_t gXpMwEoi = 0;   // xAPIC: virtual address of the EOI register; 0: x2APIC
 void xpMwStub();
 }
 asm(R"(
@@ -476,10 +478,17 @@ _xpMwStub:
 	pushq %rcx
 	pushq %rdx
 	lock incl _gXpMwIrq(%rip)
+	movq _gXpMwEoi(%rip), %rax
+	testq %rax, %rax
+	jz 1f
+	movl $0, (%rax)
+	jmp 2f
+1:
 	movl $0x80B, %ecx
 	xorl %eax, %eax
 	xorl %edx, %edx
 	wrmsr
+2:
 	popq %rdx
 	popq %rcx
 	popq %rax
@@ -489,32 +498,49 @@ static constexpr uint8_t xpMwVector = 0xF2;
 alignas(4096) static uint8_t gXpMwIdt[4096];
 alignas(64) static volatile uint64_t gXpMwMonitor[8];
 static int gXpMwPeriodUs = 2000, gXpMwLast = 0;
-static char gXpMwText[400];
+static char gXpMwText[440];
+static IOMemoryMap *gXpMwApicMap = nullptr;
+static volatile uint32_t *gXpMwApic = nullptr;   // xAPIC MMIO page; nullptr: x2APIC MSRs
+static inline uint32_t xpApicRd(unsigned off) { return gXpMwApic ? gXpMwApic[off / 4] : (uint32_t)xpRdmsr(0x800 + off / 16); }
+static inline void xpApicWr(unsigned off, uint32_t v) { if (gXpMwApic) gXpMwApic[off / 4] = v; else xpWrmsr(0x800 + off / 16, v); }
 struct __attribute__((packed)) XpIdtr { uint16_t limit; uint64_t base; };
 static void xpMwTest(int iters) {
 	int code = 0;
-	uint64_t apic = 0, lvt = 0, tpr = 0, dl = 0, apicId = 0, t0 = 0, t1 = 0, c6 = 0, c7 = 0, irr = 0, minUs = ~0ULL, maxUs = 0;
-	uint32_t irq = 0;
+	uint64_t apic = 0, dl = 0, t0 = 0, t1 = 0, c6 = 0, c7 = 0, minUs = ~0ULL, maxUs = 0;
+	uint32_t irq = 0, lvt = 0, tpr = 0, apicId = 0, irr = 0, svr = 0;
 	const uint64_t tpms = gXpTscPerMs, period = tpms * (uint64_t)gXpMwPeriodUs / 1000ULL;
 	uint32_t a = 1, b, c = 0, d;
 	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
-	const bool hasMwait = (c >> 3) & 1, hasX2 = (c >> 21) & 1, hasDl = (c >> 24) & 1;
+	const bool hasMwait = (c >> 3) & 1, hasDl = (c >> 24) & 1;
 	const uint32_t mok = gXpMsrOk;
-	if (!hasMwait || !hasX2 || !hasDl) code = -1;
+	apic = xpRdmsr(0x1B);
+	const bool x2 = (apic & 0xC00) == 0xC00;
+	if (!hasMwait || !hasDl) code = -1;
 	else if (!period) code = -2;
-	else {
+	else if (!(apic & 0x800)) code = -3;   // APIC globally disabled
+	else if (!x2 && !gXpMwApicMap) {
+		if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(apic & 0xFFFFFF000ULL, 0x1000, kIODirectionInOut)) {
+			gXpMwApicMap = md->map(kIOMapInhibitCache);
+			md->release();
+		}
+		if (!gXpMwApicMap) code = -6;
+	}
+	if (!code) {
+		gXpMwApic = x2 ? nullptr : reinterpret_cast<volatile uint32_t *>(gXpMwApicMap->getVirtualAddress());
+		gXpMwEoi = x2 ? 0 : reinterpret_cast<uint64_t>(gXpMwApic) + 0xB0;
 		const boolean_t ints = ml_set_interrupts_enabled(FALSE);
-		apic = xpRdmsr(0x1B);
 		XpIdtr kidt {};
 		asm volatile("sidt %0" : "=m"(kidt));
-		if ((apic & 0xC00) != 0xC00) code = -3;   // not in x2APIC mode
+		if (xpRdmsr(0x1B) != apic) code = -7;
 		else if ((size_t)kidt.limit + 1 > sizeof(gXpMwIdt) || kidt.limit < xpMwVector * 16 + 15) code = -4;
 		else {
-			lvt = xpRdmsr(0x832);
+			lvt = xpApicRd(0x320);
+			svr = xpApicRd(0xF0);
 			if (((lvt >> 17) & 3) != 2) code = -5;   // XNU's timer not in TSC deadline mode: leave it alone
+			else if (!(svr & 0x100)) code = -8;     // APIC software disabled
 			else {
-				apicId = xpRdmsr(0x802);
-				tpr = xpRdmsr(0x808);
+				apicId = x2 ? xpApicRd(0x20) : xpApicRd(0x20) >> 24;
+				tpr = xpApicRd(0x80);
 				dl = xpRdmsr(0x6E0);
 				memcpy(gXpMwIdt, reinterpret_cast<const void *>(kidt.base), (size_t)kidt.limit + 1);
 				uint16_t cs;
@@ -528,8 +554,8 @@ static void xpMwTest(int iters) {
 				g[12] = g[13] = g[14] = g[15] = 0;
 				XpIdtr ours {kidt.limit, reinterpret_cast<uint64_t>(gXpMwIdt)};
 				asm volatile("lidt %0" : : "m"(ours) : "memory");
-				xpWrmsr(0x808, 0xE0);
-				xpWrmsr(0x832, (lvt & ~0x100FFULL) | xpMwVector);   // unmask, our vector, mode kept
+				xpApicWr(0x80, 0xE0);
+				xpApicWr(0x320, (lvt & ~0x100FFU) | xpMwVector);   // unmask, our vector, mode kept
 				const uint64_t c6a = (mok & (1U << 11)) ? xpRdmsr(0x3FD) : 0, c7a = (mok & (1U << 12)) ? xpRdmsr(0x3FE) : 0;
 				const uint32_t irq0 = gXpMwIrq;
 				t0 = xpRdtsc();
@@ -548,9 +574,9 @@ static void xpMwTest(int iters) {
 				c7 = (mok & (1U << 12)) ? xpRdmsr(0x3FE) - c7a : 0;
 				xpWrmsr(0x6E0, 0);
 				asm volatile("sti\n\tnop\n\tnop\n\tcli" : : : "memory");   // a deadline that fired after the last cli lands here
-				irr = xpRdmsr(0x827);   // IRR 0xE0..0xFF
-				xpWrmsr(0x832, lvt);
-				xpWrmsr(0x808, tpr);
+				irr = xpApicRd(0x270);   // IRR 0xE0..0xFF
+				xpApicWr(0x320, lvt);
+				xpApicWr(0x80, tpr);
 				asm volatile("lidt %0" : : "m"(kidt) : "memory");
 				if (dl) xpWrmsr(0x6E0, dl);   // XNU's deadline (fires at once if it already passed)
 			}
@@ -561,10 +587,10 @@ static void xpMwTest(int iters) {
 	const uint64_t tot = tpms && t1 > t0 ? (t1 - t0) * 1000ULL / tpms : 0;
 	snprintf(gXpMwText, sizeof(gXpMwText),
 		"code=%d iters=%d period_us=%d irq=%u total_us=%llu min_us=%llu max_us=%llu core_c6_us=%llu core_c7_us=%llu"
-		" irr_e0=0x%llx apic=0x%llx apicid=%llu lvt=0x%llx tpr=0x%llx dl_was=%d mwait=%d x2apic=%d tscdl=%d",
+		" irr_e0=0x%x apic=0x%llx mode=%s apicid=%u lvt=0x%x svr=0x%x tpr=0x%x dl_was=%d mwait=%d tscdl=%d",
 		code, iters, gXpMwPeriodUs, irq, tot, minUs == ~0ULL ? 0 : minUs, maxUs,
 		tpms ? c6 * 1000ULL / tpms : 0, tpms ? c7 * 1000ULL / tpms : 0,
-		irr, apic, apicId, lvt, tpr, dl ? 1 : 0, hasMwait, hasX2, hasDl);
+		irr, apic, x2 ? "x2apic" : "xapic", apicId, lvt, svr, tpr, dl ? 1 : 0, hasMwait, hasDl);
 }
 static int xpMwTestHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	int value = gXpMwLast;
