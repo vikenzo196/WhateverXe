@@ -9416,6 +9416,8 @@ bool XE::display13EDPBlankActive=false;
 // blank decision, which wrapDisplay13SetPowerState consults first for non-DSI
 // framebuffers (display13EDPBlankPower).
 static mach_vm_address_t display13FBStopTransactions=0,display13FBRestoreTransactions=0,display13FBSetupTransactions=0;
+static void display13EDPUnblankWork(thread_call_param_t,thread_call_param_t);
+static thread_call_t display13EDPUnblankCall=nullptr; // deferred unblank after an s2idle wake
 bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  display13EDPBlankActive=false;
  if(!display13EDPBlankRequested() || !display13EDPKeep() || !display13FramebufferRequested || size<0x24E00)return false;
@@ -9423,6 +9425,7 @@ bool XE::processDisplay13EDPBlank(KernelPatcher &patcher,size_t index,mach_vm_ad
  const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
  if(fn!=address+0x24DE8 || !orgDSIAttributes[2])return false;
  display13EDPBlankActive=true;
+ if(!display13EDPUnblankCall)display13EDPUnblankCall=thread_call_allocate(display13EDPUnblankWork,nullptr);
  // s2idle sleep: replay the donor's own transaction stop/restore around a kept-link
  // system sleep (local symbols of the same exact image as setFramebufferPowerState).
  display13FBStopTransactions=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21AppleIntelFramebuffer16StopTransactionsEv",address,size);patcher.clearError();
@@ -9471,6 +9474,24 @@ static uint32_t display13EDPBlankSleepMark=0;
 // or a dark wake) re-enables its plane: undo it right after the donor's PerformFlipTransaction, in
 // the same frame (PLANE_SURF write latches). Try-lock only: never wait on the power path here.
 static uint32_t display13EDPBlankEnforced=0;
+static bool display13EDPUnblankPending=false;
+static uint32_t display13EDPUnblankDeferred=0,display13EDPUnblankDone=0;
+static void display13EDPUnblankWork(thread_call_param_t,thread_call_param_t) {
+ auto &c=display13FBPower;auto &b=display13EDPBlankState;
+ if(!c.lock || !c.map || c.map->getLength()!=0x1000000)return;
+ IOLockLock(c.lock);
+ auto fb=display13EDPBlankedFB;
+ if(display13EDPUnblankPending && b.blanked && fb && Display13FBMemory::field<uint32_t>(fb,0x4284)==Display13EDPBlank::Wake) {
+  struct IO {
+   uintptr_t base;
+   uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
+   void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
+  } io {c.map->getVirtualAddress()};
+  Display13EDPBlank::unblank(io,b);++display13EDPUnblankDone;
+ }
+ display13EDPUnblankPending=false;
+ IOLockUnlock(c.lock);
+}
 static void display13EDPBlankEnforce(IOService *fb) {
  auto &c=display13FBPower;auto &b=display13EDPBlankState;
  if(!fb || fb!=display13EDPBlankedFB || !b.blanked || !c.lock || !c.map || c.map->getLength()!=0x1000000)return;
@@ -9593,15 +9614,33 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
   // During an s2idle system sleep the donor may release FB0's scanout binding
   // while the panel is blanked; the framebuffer we blanked stays ours to wake.
   if(!eligible && mapped && b.blanked && fb==display13EDPBlankedFB &&
-   (xePmS2idleSleeping() || fb==display13EDPS2Sleeping || xePmS2idleSleeps()!=display13EDPBlankSleepMark))eligible=true;
-  action=mapped ? B::decide(eligible,current,state,b.blanked) : B::Action::Native;
+   (xePmS2idleSleeping() || fb==display13EDPS2Sleeping || xePmS2idleSleeps()!=display13EDPBlankSleepMark ||
+    display13EDPUnblankPending))eligible=true;
+  // The blanked state belongs to the framebuffer that blanked: a peer's Wake (an external FB can
+  // be asked before FB0 after a system sleep) must not unblank FB0's pipe and leave FB0's own
+  // Wake to the native path (full mode set, cyan flash).
+  const bool ours=b.blanked && fb==display13EDPBlankedFB;
+  action=mapped ? B::decide(eligible,current,state,ours) : B::Action::Native;
   struct IO {
    uintptr_t base;
    uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {base};
   if(action==B::Action::Blank){B::blank(io,b);display13EDPBlankedFB=fb;display13EDPBlankSleepMark=xePmS2idleSleeps();}
-  else if(action==B::Action::Unblank)B::unblank(io,b);
+  else if(action==B::Action::Unblank) {
+   // After an s2idle system sleep the wake replays the donor's colour pipeline, last flip and
+   // WindowServer's partial mode set; a plane enabled before that shows a transient wrong
+   // colour frame (cyan). Keep the plane dark (flips are undone meanwhile) and enable it
+   // ~300 ms later from a thread call; the power state is published as Wake right away.
+   const bool s2wake=display13EDPUnblankCall && (xePmS2idleSleeping() || fb==display13EDPS2Sleeping ||
+    xePmS2idleSleeps()!=display13EDPBlankSleepMark);
+   if(s2wake) {
+    display13EDPUnblankPending=true;++display13EDPUnblankDeferred;
+    uint64_t deadline;clock_interval_to_deadline(300,kMillisecondScale,&deadline);
+    thread_call_enter_delayed(display13EDPUnblankCall,deadline);
+   } else B::unblank(io,b);
+  }
+  if(state<B::Wake)display13EDPUnblankPending=false;
   // The donor's last framebuffer to enter Sleep saves the controller and disables the display
   // interrupts (prepareToEnterSleep: hwSaveState, hwDisableInterrupts -> 0x44200=0, when every
   // other FB is at 0); the first one to leave Sleep restores them (prepareToExitSleep:
@@ -9616,7 +9655,8 @@ bool XE::display13EDPBlankPowerImpl(IOService *fb,uint32_t state,uint32_t &resul
  }
  // version, requested, previous, eligible, action, blanks, unblanks, plane, cursor
  display13EDPBlankLastCurrent=current;display13EDPBlankLastEligible=eligible;display13EDPBlankLastAction=static_cast<uint32_t>(action);
- const uint32_t record[10]={3,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor,display13EDPBlankEnforced};
+ const uint32_t record[12]={4,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor,
+  display13EDPBlankEnforced,display13EDPUnblankDeferred,display13EDPUnblankDone};
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
  if(eligible && action!=B::Action::Native){result=kIOReturnSuccess;return true;}
  return false;
