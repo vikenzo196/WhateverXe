@@ -98,6 +98,7 @@ static int xpD3() {
 		0x51fc, 0x54fc, 0xa0fc,           // ISH (ADP-P, ADP-N, TGP-LP)
 		0xa71d, 0x461d, 0x9a03,           // DPTF processor participant
 		0xa73e, 0xa76d, 0x463e, 0x466d, 0x9a1b, 0x9a1d,   // Thunderbolt 4 / USB4 DMA (macOS has no host driver here)
+		0x51d8, 0x51d9,                   // ADP-P LPSS I2C6/I2C7 (the THC IP slot): left in D0 without a client it keeps a 517 ns LTR
 	};
 	int n = 0;
 	OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
