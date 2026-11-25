@@ -123,9 +123,17 @@ static int xpD3() {
 
 // ─── S0ixSleep (separate kext) owning the system sleep: boot-arg -wex-s0ixsleep ─────────────────────────────────
 // XE-PM then leaves acpi_sleep_kernel to S0ixSleep, and the display code follows S0ixSleep's sleep state through the
-// structure it publishes on IOResources ("S0ixSleep": OSData with its address, version 1). The pointer is looked up
-// from thread context (xpApply at 20/60 s, s2stat) and only read elsewhere.
-struct XpS0ixShared { uint32_t version; volatile uint32_t enabled, sleeping, sleeps, reason; };
+// structure it publishes on IOResources ("S0ixSleep": OSData with its address). The pointer is looked up from thread
+// context (xpApply at 20/60 s, s2stat) and only read elsewhere. From version 2 the structure also lets a driver add a
+// hook that S0ixSleep calls inside its wait (phase 0 entering, 1 leaving, interrupts off, one CPU): the GT reset that
+// XE-PM's own wait does at the end runs there.
+typedef void (*XpS0ixHook)(void *context, uint32_t phase, uint32_t reason);
+struct XpS0ixShared {
+	uint32_t version; volatile uint32_t enabled, sleeping, sleeps, reason;
+	uint32_t hookSlots;                                // version >= 2
+	bool (*addHook)(XpS0ixHook hook, void *context);   // version >= 2, thread context
+};
+static void xpS0ixRegisterHooks(const XpS0ixShared *sh);
 static bool gXpS0ixMode = false;
 static const XpS0ixShared *gXpS0ix = nullptr;
 static void xpFindS0ix() {
@@ -136,7 +144,9 @@ static void xpFindS0ix() {
 	uint64_t a = 0;
 	memcpy(&a, d->getBytesNoCopy(), sizeof(a));
 	auto *sh = reinterpret_cast<const XpS0ixShared *>(a);
-	if (sh && sh->version == 1) __atomic_store_n(&gXpS0ix, sh, __ATOMIC_RELEASE);
+	if (!sh || sh->version < 1 || sh->version > 99) return;
+	__atomic_store_n(&gXpS0ix, sh, __ATOMIC_RELEASE);
+	if (sh->version >= 2) xpS0ixRegisterHooks(sh);
 }
 static inline const XpS0ixShared *xpS0ix() { return __atomic_load_n(&gXpS0ix, __ATOMIC_ACQUIRE); }
 static void xpApply(thread_call_param_t, thread_call_param_t) {
@@ -283,6 +293,33 @@ static uint8_t gXpGpeEn[16];
 // gen6_hw_domain_reset). The display engine is not part of this reset.
 static volatile uint8_t *gXpGpuMmio = nullptr;
 static uint32_t gXpGdrst = 0;
+static void xpGtReset() {
+	if (!gXpGpuMmio) return;
+	// Hold forcewake across the reset like Linux __intel_gt_reset (render, GT, media domains: request/ack).
+	static constexpr uint32_t fw[4][2] = {{0xA278, 0x0D84}, {0xA188, 0x130044}, {0xA540, 0x0D50}, {0xA560, 0x0D70}};
+	auto reg = [](uint32_t r) { return reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + r); };
+	for (auto &f : fw) {
+		*reg(f[0]) = 0x00010001U;
+		for (unsigned spins = 0; !(*reg(f[1]) & 1U) && spins < 200; spins++) for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
+	}
+	auto gdrst = reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + 0x941C);
+	*gdrst = 1U;   // GRDOM_FULL
+	uint32_t spins = 0;
+	while ((*gdrst & 1U) && spins < 2000) { for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause(); spins++; }
+	gXpGdrst = (*gdrst & 1U) ? 0x80000000U | spins : spins + 1;
+	for (auto &f : fw) *reg(f[0]) = 0x00010000U;
+}
+// S0ixSleep wait hook (its interrupts-off, single-CPU context): the GT reset on the way out.
+static uint32_t gXpS0ixHookCalls[2] = {0, 0};
+static int gXpS0ixHooked = 0;   // 1 added, -1 refused (no free slot)
+static void xpS0ixHook(void *, uint32_t phase, uint32_t) {
+	if (phase < 2) gXpS0ixHookCalls[phase]++;
+	if (phase == 1) xpGtReset();
+}
+static void xpS0ixRegisterHooks(const XpS0ixShared *sh) {
+	if (gXpS0ixHooked || !sh->addHook) return;
+	gXpS0ixHooked = sh->addHook(xpS0ixHook, nullptr) ? 1 : -1;
+}
 void xePmSetGpuMmio(volatile uint8_t *mmio) { gXpGpuMmio = mmio; }
 bool xePmS2idleActive() { if (const XpS0ixShared *s = xpS0ix()) return s->enabled != 0; return gXpSleepMode == 1 && gXpOrgAcpiSleep; }
 // True from kIOMessageSystemWillSleep to kIOMessageSystemHasPoweredOn of a system sleep taken with s2idle armed:
@@ -562,21 +599,7 @@ static void xpFakeSleep(void *) {
 		}
 	}
 	if (reason == 1) xpOutw(xpPm1Sts, 1U << 8);
-	if (gXpGpuMmio) {
-		// Hold forcewake across the reset like Linux __intel_gt_reset (render, GT, media domains: request/ack).
-		static constexpr uint32_t fw[4][2] = {{0xA278, 0x0D84}, {0xA188, 0x130044}, {0xA540, 0x0D50}, {0xA560, 0x0D70}};
-		auto reg = [](uint32_t r) { return reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + r); };
-		for (auto &f : fw) {
-			*reg(f[0]) = 0x00010001U;
-			for (unsigned spins = 0; !(*reg(f[1]) & 1U) && spins < 200; spins++) for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause();
-		}
-		auto gdrst = reinterpret_cast<volatile uint32_t *>(gXpGpuMmio + 0x941C);
-		*gdrst = 1U;   // GRDOM_FULL
-		uint32_t spins = 0;
-		while ((*gdrst & 1U) && spins < 2000) { for (unsigned k = 0; k < 2000; k++) __builtin_ia32_pause(); spins++; }
-		gXpGdrst = (*gdrst & 1U) ? 0x80000000U | spins : spins + 1;
-		for (auto &f : fw) *reg(f[0]) = 0x00010000U;
-	}
+	xpGtReset();
 	gXpSleepReason = reason; gXpSleepLoops = loops; gXpSleepCount++;
 	if (reason != 2 && reason != 3) __atomic_store_n(&gXpUserWakePending, true, __ATOMIC_RELEASE);
 }
@@ -632,7 +655,8 @@ static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 		" ecgpe=%d ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u"
 		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u pp1_mw=%llu psys_mw=%llu pkgcst=0x%llx msrok=0x%x"
 		" rc6=%u gtcore=0x%x/0x%x trans=0x%x plane=0x%x dc=0x%x pwell=0x%x pipemisc=0x%x"
-		" mw=%u period_ms=%d mwirq=%u mw_c6_ms=%llu mw_c7_ms=%llu apic_found=0x%llx svr_found=0x%x mwfail=%u s0ix=%d/%d",
+		" mw=%u period_ms=%d mwirq=%u mw_c6_ms=%llu mw_c7_ms=%llu apic_found=0x%llx svr_found=0x%x mwfail=%u s0ix=%d/%d"
+		" s0ixhook=%d/%u/%u",
 		gXpSleepRoute, gXpSleepMode, gXpSleepCount, gXpSleepReason, gXpSleepLoops, gXpGdrst, en,
 		gXpSleepWait, gXpWaitPkg, gXpSleepSafety, gXpTscPerMs, gXpSleepMs, gXpSleepPkgMw, gXpSleepCoreMw, gXpSleepHwp,
 		gXpEcGpe, gXpEcIgnored, gXpEcLast[0], gXpEcLast[1], gXpEcLast[2], gXpEcLast[3], gXpUserWakeCount,
@@ -640,7 +664,7 @@ static int xpSleepStatHandler(struct sysctl_oid *oidp, void *, int, struct sysct
 		gXpPp1Mw, gXpPsysMw, gXpPkgCst, gXpMsrOk,
 		gXpRc6, gXpGtCore[0], gXpGtCore[1], gXpDisp[0], gXpDisp[1], gXpDisp[2], gXpDisp[3], gXpDisp[4],
 		gXpMwUsed, gXpSleepPeriodMs, gXpMwSleepIrq, gXpMwSleepC6, gXpMwSleepC7, gXpMwFoundBase, gXpMwFoundSvr, gXpMwFail,
-		gXpS0ixMode ? 1 : 0, xpS0ix() ? 1 : 0);
+		gXpS0ixMode ? 1 : 0, xpS0ix() ? 1 : 0, gXpS0ixHooked, gXpS0ixHookCalls[0], gXpS0ixHookCalls[1]);
 	return sysctl_handle_string(oidp, gXpSleepText, sizeof(gXpSleepText), req);
 }
 SYSCTL_PROC(_debug_xepm, OID_AUTO, s2idle, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpSleepHandler, "I", "1 = sleep without S3");
