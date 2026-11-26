@@ -9339,6 +9339,22 @@ static int msrValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
     else snprintf(msrText,sizeof(msrText),"msr %x = %08x%08x",msrAddr,hi,lo);
     return sysctl_handle_string(oidp,msrText,sizeof(msrText),req);
 }
+// Write the package C-state interrupt response time limits only (MSR 0x60A-0x60C, 0x633-0x635, package scope):
+// debug.wexpsr.msraddr = one of them, then debug.wexpsr.irtl = value (bit 15 valid, 12:10 unit, 9:0 limit).
+static int irtlHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=0;
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    const bool irtl=(msrAddr>=0x60A && msrAddr<=0x60C) || (msrAddr>=0x633 && msrAddr<=0x635);
+    if(!irtl || (static_cast<uint32_t>(value)&~0x9FFFU))return EINVAL;
+    uint32_t lo=0,hi=0;
+    if(::xePmRdmsrCarefully(msrAddr,&lo,&hi))return ENXIO;
+    const boolean_t ints=ml_set_interrupts_enabled(false);
+    asm volatile("wrmsr" : : "c"(msrAddr), "a"(static_cast<uint32_t>(value)), "d"(0U));
+    ml_set_interrupts_enabled(ints);
+    return 0;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, irtl, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, irtlHandler, "I", "write the IRTL MSR selected by msraddr");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, msraddr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, msrAddrHandler, "IU", "MSR for msrval");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, msrval, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, msrValHandler, "A", "MSR at msraddr (read only)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, physaddr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, physAddrHandler, "IU", "physical address for physval");
@@ -9423,6 +9439,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+    sysctl_register_oid(&sysctl__debug_wexpsr_irtl);
     sysctl_register_oid(&sysctl__debug_wexpsr_msraddr);
     sysctl_register_oid(&sysctl__debug_wexpsr_msrval);
     sysctl_register_oid(&sysctl__debug_wexpsr_physaddr);
