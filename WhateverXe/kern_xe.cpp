@@ -1,4 +1,5 @@
 #include "kern_display13_color.hpp"
+#include <architecture/i386/pio.h>
 #include <mach/clock.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
@@ -8845,6 +8846,102 @@ constexpr uint32_t PwCtl=0x45404,AuxCtl2=0x45444,DdiCtl2=0x45454;
 constexpr uint32_t PwReqs[4]={1U<<15,1U<<13,1U<<11,1U<<3}; // PW_C, PW_B, PW_A, PW2 (state = request>>1)
 static uint32_t dc6Dropped=0,dc6Aux=0,dc6Ddi=0;
 }
+// ---- Black box and watchdog for the DC6 measurement ----
+// Black box: when debug.wexpsr.bcofs names a CMOS byte (0x0E-0xFE, chosen from debug.wexpsr.cmos as one the
+// firmware leaves at zero), every DC6 step writes its code there and the run number into the next byte. CMOS
+// lives in the RTC well: it survives a forced power-off, so after a hang the last code shows the failing step.
+// Watchdog: debug.wexpsr.tcosec=N (>0) arms the PCH TCO timer (TCO version 6: base from SMBus 00:1f.4 config
+// 0x50 with TCOCTL bit 8, NO_REBOOT = TCO1_CNT bit 0, 0.6 s ticks, reboot on the second expiry; Linux iTCO_wdt)
+// for N seconds when DC6 is allowed, pings it when the wait ends and halts it after the chain is back.
+static int bcOfs=-1;
+static uint8_t bcRun=0;
+static uint32_t tcoBase=0,tcoCtl=0;
+static int tcoSec=0;
+static uint8_t cmosRead(uint8_t off){if(off<0x80){outb(0x70,off);return inb(0x71);}outb(0x72,off);return inb(0x73);}
+static void cmosWrite(uint8_t off,uint8_t v){if(off<0x80){outb(0x70,off);outb(0x71,v);}else{outb(0x72,off);outb(0x73,v);}}
+static void bc(uint8_t code) {
+    const int o=__atomic_load_n(&bcOfs,__ATOMIC_ACQUIRE);
+    if(o<0x0E || o>0xFE)return;
+    cmosWrite(static_cast<uint8_t>(o),code);cmosWrite(static_cast<uint8_t>(o+1),bcRun);
+}
+static char cmosText[1024];
+static int cmosHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    uint8_t v[256];
+    const boolean_t ints=ml_set_interrupts_enabled(false);
+    // 0x00-0x0D are the RTC clock and status registers (reading 0x0C acknowledges RTC interrupts): skipped.
+    for(unsigned i=0;i<256;++i)v[i]=i<0x0E ? 0 : cmosRead(static_cast<uint8_t>(i));
+    ml_set_interrupts_enabled(ints);
+    size_t u=0;
+    for(unsigned i=0;i<256 && u+4<sizeof(cmosText);++i)
+        u+=static_cast<size_t>(snprintf(cmosText+u,sizeof(cmosText)-u,(i&15)==15 ? "%02x\n" : "%02x ",v[i]));
+    return sysctl_handle_string(oidp,cmosText,sizeof(cmosText),req);
+}
+static int bcOfsHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=__atomic_load_n(&bcOfs,__ATOMIC_ACQUIRE);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=-1 && (value<0x0E || value>0xFE))return EINVAL;
+    __atomic_store_n(&bcOfs,value,__ATOMIC_RELEASE);
+    return 0;
+}
+static bool tcoFind() {
+    if(tcoBase)return true;
+    OSIterator *it=IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+    if(!it)return false;
+    while(auto *d=OSDynamicCast(IOPCIDevice,it->getNextObject())) {
+        if(d->getBusNumber()!=0 || d->getDeviceNumber()!=0x1F || d->getFunctionNumber()!=4)continue;
+        if((d->configRead32(0)&0xFFFF)!=0x8086)continue;
+        const uint32_t base=d->configRead32(0x50),ctl=d->configRead32(0x54);
+        tcoCtl=ctl;
+        if((ctl&(1U<<8)) && (base&~0x1FU) && (base&~0x1FU)<0x10000)tcoBase=base&~0x1FU;
+    }
+    it->release();
+    return tcoBase!=0;
+}
+static char tcoText[256];
+static int tcoHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    const bool ok=tcoFind();
+    if(ok)snprintf(tcoText,sizeof(tcoText),"tcobase=%04x tcoctl=%08x rld=%04x sts1=%04x sts2=%04x cnt1=%04x cnt2=%04x tmr=%04x smi_en=%08x sec=%d",
+        tcoBase,tcoCtl,inw(static_cast<uint16_t>(tcoBase)),inw(static_cast<uint16_t>(tcoBase+4)),inw(static_cast<uint16_t>(tcoBase+6)),
+        inw(static_cast<uint16_t>(tcoBase+8)),inw(static_cast<uint16_t>(tcoBase+0xA)),inw(static_cast<uint16_t>(tcoBase+0x12)),inl(0x1830),tcoSec);
+    else snprintf(tcoText,sizeof(tcoText),"no TCO (tcoctl=%08x)",tcoCtl);
+    return sysctl_handle_string(oidp,tcoText,sizeof(tcoText),req);
+}
+static int tcoSecHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=__atomic_load_n(&tcoSec,__ATOMIC_ACQUIRE);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<0 || value>600)return EINVAL;
+    if(value && !tcoFind())return ENXIO;
+    __atomic_store_n(&tcoSec,value,__ATOMIC_RELEASE);
+    return 0;
+}
+// Arm: timer value, reload, NO_REBOOT off, halt off. Returns false if the hardware keeps NO_REBOOT or the halt.
+static bool tcoArm(uint32_t sec) {
+    if(!tcoBase || !sec)return false;
+    const uint16_t b=static_cast<uint16_t>(tcoBase);
+    uint32_t ticks=sec*10/6;if(ticks<4)ticks=4;if(ticks>0x3FF)ticks=0x3FF;
+    outw(static_cast<uint16_t>(b+0x12),static_cast<uint16_t>((inw(static_cast<uint16_t>(b+0x12))&0xFC00)|ticks));
+    outw(static_cast<uint16_t>(b+4),0x0008);                                   // clear TIMEOUT
+    outw(static_cast<uint16_t>(b+6),0x0002);                                   // clear SECOND_TO_STS
+    outw(b,0x01);                                                              // reload
+    uint16_t cnt=inw(static_cast<uint16_t>(b+8))&~0x0100U;                    // NMI_NOW masked
+    outw(static_cast<uint16_t>(b+8),static_cast<uint16_t>(cnt&~0x0001U));     // NO_REBOOT off
+    cnt=inw(static_cast<uint16_t>(b+8))&~0x0100U;
+    outw(static_cast<uint16_t>(b+8),static_cast<uint16_t>(cnt&~0x0800U));     // timer halt off
+    cnt=inw(static_cast<uint16_t>(b+8));
+    return !(cnt&0x0801U);
+}
+static void tcoPing(){if(tcoBase)outw(static_cast<uint16_t>(tcoBase),0x01);}
+static void tcoHalt() {
+    if(!tcoBase)return;
+    const uint16_t b=static_cast<uint16_t>(tcoBase);
+    uint16_t cnt=inw(static_cast<uint16_t>(b+8))&~0x0100U;
+    outw(static_cast<uint16_t>(b+8),static_cast<uint16_t>(cnt|0x0800U));      // halt
+    cnt=inw(static_cast<uint16_t>(b+8))&~0x0100U;
+    outw(static_cast<uint16_t>(b+8),static_cast<uint16_t>(cnt|0x0001U));      // NO_REBOOT back on
+    outw(static_cast<uint16_t>(b+4),0x0008);outw(static_cast<uint16_t>(b+6),0x0002);
+}
 static uint32_t g5WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxUs) {
     uint32_t us=0;
     while(((rd(reg)&mask)!=0)!=set && us<maxUs){IODelay(10);us+=10;}
@@ -8855,26 +8952,38 @@ static void g5Dc6Enter() {
     const bool pipesOff=!(rd(0x71008)&(1U<<31)) && !(rd(0x72008)&(1U<<31)) && !(rd(0x73008)&(1U<<31));
     A1LOG("| DC6 arm dmc=%d pipesOff=%d pw=%08x aux=%08x ddi=%08x dcEn=%08x dcDbg=%08x dc5=%u dc6=%u ",dmcLoaded,pipesOff,rd(PwCtl),
         rd(AuxCtl2),rd(DdiCtl2),rd(DCStateEn),rd(DCStateDebug),rd(DC5Count),rd(DC6Count));
-    if(!dmcLoaded || !pipesOff)return;
+    if(!dmcLoaded || !pipesOff){bc(0x1F);return;}
+    const uint32_t sec=static_cast<uint32_t>(__atomic_load_n(&tcoSec,__ATOMIC_ACQUIRE));
+    const bool armed=sec && tcoArm(sec);
+    A1LOG("tco=%u/%d ",sec,armed);
+    bc(0x11);
     dc6Dropped=0;
     for(auto req:PwReqs)if(rd(PwCtl)&req){wr(PwCtl,rd(PwCtl)&~req);dc6Dropped|=req;(void)g5WaitBit(PwCtl,req>>1,false,1000);}
+    bc(0x12);
     dc6Aux=rd(AuxCtl2)&2U;if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)&~2U);(void)g5WaitBit(AuxCtl2,1U,false,1000);}
     dc6Ddi=rd(DdiCtl2)&2U;if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)&~2U);(void)g5WaitBit(DdiCtl2,1U,false,1000);}
+    A1LOG("released=%08x pw=%08x aux=%08x ddi=%08x ",dc6Dropped,rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2));
+    bc(0x13);
     writeDCState(2);
     dc6Active=true;
-    A1LOG("released=%08x pw=%08x aux=%08x ddi=%08x dcEn=%08x ",dc6Dropped,rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),rd(DCStateEn));
+    bc(0x14);
 }
 static void g5Dc6Exit() {
     using namespace G5;
     if(!dc6Active)return;
     dc6Active=false;dc6Arm=0;
-    const uint32_t dc5=rd(DC5Count),dc6=rd(DC6Count),en=rd(DCStateEn);
+    tcoPing();
+    bc(0x21);
+    const uint32_t en=rd(DCStateEn);
     writeDCState(0);
+    bc(0x22);
     uint32_t pwUs=0;
     const uint32_t order[4]={1U<<3,1U<<11,1U<<13,1U<<15}; // PW2, PW_A, PW_B, PW_C
     for(auto req:order)if(dc6Dropped&req){wr(PwCtl,rd(PwCtl)|req);pwUs+=g5WaitBit(PwCtl,req>>1,true,10000);}
     if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)|2U);pwUs+=g5WaitBit(AuxCtl2,1U,true,10000);}
     if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)|2U);pwUs+=g5WaitBit(DdiCtl2,1U,true,10000);}
+    bc(0x23);
+    const uint32_t dc5=rd(DC5Count),dc6=rd(DC6Count);
     A1LOG("| DC6 exit dcEnWas=%08x dc5=%u dc6=%u dcEn=%08x pw=%08x aux=%08x ddi=%08x wellsUs=%u dss=%08x/%08x pps78070=%08x plane1buf=%08x ",
         en,dc5,dc6,rd(DCStateEn),rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),pwUs,rd(0x78000),rd(0x78004),rd(0x78070),rd(0x7027C));
 }
@@ -8884,6 +8993,7 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
     if(phase==0) {
         ++stat[0];
         if(!OSCompareAndSwap(0,1,&A1::busy)){++stat[9];return;}
+        ++bcRun;bc(0x10);
         gRaw=true;const int r=g2Off(true,true,true);
         if(!r && __atomic_load_n(&dc6Arm,__ATOMIC_ACQUIRE))g5Dc6Enter();
         gRaw=false;
@@ -8893,7 +9003,10 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
     } else if(phase==1) {
         if(!g2s.active)return;
         ++stat[3];stat[8]=reason;
-        gRaw=true;g5Dc6Exit();const int r=g2On();gRaw=false;
+        bc(0x20);
+        gRaw=true;g5Dc6Exit();bc(0x24);const int r=g2On();gRaw=false;
+        bc(r ? 0x2E : 0x2F);
+        tcoHalt();
         stat[7]=static_cast<uint32_t>(r);
         if(r)++stat[5];else ++stat[4];
         A1LOG(" | wake reason=%u aux=%u/%u/%u",reason,auxXfers,auxRetries,auxFails);
@@ -8944,6 +9057,10 @@ static int a5Dc6Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *re
     __atomic_store_n(&G5::dc6Arm,value,__ATOMIC_RELEASE);
     return 0;
 }
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, cmos, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, cmosHandler, "A", "CMOS bytes 0x00-0xFF (read only)");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, bcofs, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, bcOfsHandler, "I", "CMOS byte for the DC6 black box (-1 off)");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, tco, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, tcoHandler, "A", "PCH TCO watchdog registers (read only)");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, tcosec, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, tcoSecHandler, "I", "TCO watchdog seconds armed during the DC6 measurement (0 off)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5dc6, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Dc6Handler, "I", "1: next A5 sleep also releases PW_C/B/A/PW2, AUX A, DDI A IO and allows DC6 (one sleep)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5test, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TestHandler, "I", "N=600-5000: the A5 raw sequence from thread context");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5stat, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a5StatHandler, "A", "A5 counters");
@@ -9003,6 +9120,10 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
+    sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
+    sysctl_register_oid(&sysctl__debug_wexpsr_bcofs);
+    sysctl_register_oid(&sysctl__debug_wexpsr_tco);
+    sysctl_register_oid(&sysctl__debug_wexpsr_tcosec);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5stat);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5log);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
