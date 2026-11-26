@@ -27,6 +27,7 @@
 #include "kern_wex_flip_trace.hpp"
 #include "kern_wex_tc_diag.hpp"
 #include "kern_wex_dmc_adlp.hpp"
+#include "kern_wex_dmc_adlp_pipes.hpp"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include "kern_xelp_device.hpp"
 #include "kern_xelp_memory_layout.hpp"
@@ -8129,13 +8130,34 @@ static int dmcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req)
     if(!map || !lock)return ENODEV;
     IOLockLock(lock);
     if(!dmcLoaded) {
+        // Like Linux intel_dmc_load_program on display 13: Wa_16015201720 (pipe DMC clock gating off for every pipe
+        // while loading, and for good on pipes A/B, whose pipe DMC state the main DMC saves and restores across
+        // DC5/DC6), then main and pipe A-D programs, each with its event handlers disabled first; the pipe DMC
+        // event controls are written disabled (dmc_evt_ctl_disable), the main ones as the firmware defines them.
+        constexpr uint32_t PsfGate[4]={0x4654C,0x46550,0x46554,0x46558},PipeDmcGatingDis=1U<<12;
+        for(auto r:PsfGate)wr(r,rd(r)|PipeDmcGatingDis);
         for(unsigned h=0;h<8;++h){wr(0x8F034+4*h,(3U<<16)|(1U<<8));wr(0x8F004+4*h,0);}
         for(uint32_t i=0;i<WEXDMCADLP::words;++i)wr(WEXDMCADLP::start+4*i,WEXDMCADLP::payload[i]);
         for(uint32_t i=0;i<WEXDMCADLP::count;++i)wr(WEXDMCADLP::mmioAddr[i],WEXDMCADLP::mmioData[i]);
+        for(const auto &pr:WEXDMCADLPPipes::programs) {
+            const uint32_t base=0x5F000+0x400*(pr.id-1);
+            for(unsigned h=0;h<8;++h){wr(base+0x34+4*h,(3U<<16)|(1U<<8));wr(base+0x04+4*h,0);}
+            for(uint32_t i=0;i<pr.words;++i)wr(pr.start+4*i,pr.payload[i]);
+            for(uint32_t i=0;i<pr.count;++i) {
+                const uint32_t a=pr.mmioAddr[i],d=pr.mmioData[i];
+                const bool evtCtl=a>=base+0x34 && a<base+0x34+4*8;
+                wr(a,evtCtl ? (d&(1U<<31))|(3U<<16)|(1U<<8) : d);
+            }
+        }
         wr(DCStateDebug,rd(DCStateDebug)|3U);
+        for(unsigned p=2;p<4;++p)wr(PsfGate[p],rd(PsfGate[p])&~PipeDmcGatingDis);
         // Readback: program word 0 and the SSP/HTP pair Linux checks.
         dmcResult=(rd(WEXDMCADLP::start)==WEXDMCADLP::payload[0]?1U:0U)|(rd(0x8F074)?2U:0U)|(rd(0x8F004)?4U:0U);
-        dmcLoaded=dmcResult==7;
+        for(unsigned k=0;k<4;++k) {
+            const auto &pr=WEXDMCADLPPipes::programs[k];
+            if(rd(pr.start)==pr.payload[0] && rd(0x5F074+0x400*k)==pr.mmioData[0])dmcResult|=8U<<k;
+        }
+        dmcLoaded=(dmcResult&7)==7;
     }
     IOLockUnlock(lock);
     uint32_t r[]={1,dmcResult,WEXDMCADLP::fwVersion,rd(0x8F074),rd(0x8F004),rd(DCStateDebug)};
