@@ -8884,8 +8884,11 @@ static uint32_t core0[4];
 // with the pipe off, skipping read-only/status registers and the LUT index/data windows; the LUTs (10-bit gamma
 // PAL_PREC, 1024 entries; pre-CSC degamma, 131 entries on display 13) go through their auto-increment windows.
 struct PwaRange { uint32_t start,dwords; };
-constexpr PwaRange PwaRanges[7]={{0x60000,64},{0x60200,128},{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,256}};
-constexpr uint32_t PwaDwords=64+128+1024+1024+128+320+256;
+// 0x42000-0x420FC: display chicken registers. CHICKEN_MISC_2 (0x42084) bit 30 CHICKEN_MISC_DISABLE_DPT (adl) is set by
+// the firmware/donor, which do not use display page tables; DC5/DC6 resets it (the DMC does not restore it) and tiled
+// planes then scan out through a DPT that does not exist: black desktop, visible cursor.
+constexpr PwaRange PwaRanges[8]={{0x42000,64},{0x60000,64},{0x60200,128},{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,256}};
+constexpr uint32_t PwaDwords=64+64+128+1024+1024+128+320+256;
 
 static uint32_t pwaSave[PwaDwords];
 static uint32_t gammaSave[1024],degammaSave[131];
@@ -8898,6 +8901,7 @@ static bool pwaSkip(uint32_t r) {
     switch(r) {
     case 0x70000:case 0x70008:case 0x70040:case 0x70044:case 0x70048:case 0x7004C: // DSL, TRANSCONF, counters, stamps
     case 0x4A400:case 0x4A404:case 0x4A408:case 0x4A40C:case 0x4A484:case 0x4A488:  // LUT index/data windows
+    case 0x42000:                                                                   // FUSE_STATUS (read only)
         return true;
     }
     if(r>=0x70000 && r<0x71000 && ((r&0xFF)==0xAC))return true;                   // PLANE_SURFLIVE (x80 planes)
