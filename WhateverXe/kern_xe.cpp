@@ -7986,6 +7986,19 @@ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
+// G phase 2 experiments: native AUX transfer on the panel port last seen answering, with the
+// Display13 power checks of wrapDisplay13Read/WriteAUX but without the -wex-edp-keep link caps
+// on reads (the raw sink values are needed).
+uint32_t XE::edpAuxRaw(bool write,uint32_t address,void *data,uint32_t length) {
+ void *port=__atomic_load_n(&display13EDPAuxBLPort,__ATOMIC_ACQUIRE);
+ auto &c=display13FBPower;if(!port || !c.lock || !data || !length || length>16)return kIOReturnNotReady;
+ IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ if(!ready)return kIOReturnNotReady;
+ const auto r=write ? FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,address,data,length)
+                    : FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,address,data,length);
+ IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
+ return r ? r : complete ? 0 : kIOReturnNotReady;
+}
 // -wex-edp-auxbl (Display13EDPAuxBL): hwSetBacklight of a kept type-5 AUX
 // panel writes the DPCD brightness through the native AUX path (with the
 // Display13 power checks of wrapDisplay13Read/WriteAUX) instead of the PWM
@@ -8249,6 +8262,154 @@ static int g1bHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req)
     return sysctl_handle_string(oidp,g1bText,sizeof(g1bText),req);
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, g1b, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, g1bHandler, "A", "read-only PPS / combo PHY A / DPLL snapshot");
+// ---- G phase 2, step A1: live retrain of the firmware's eDP link (runtime only, off by default) ----
+// debug.wexpsr.a1=1 retrains the eDP link of DDI A / transcoder A with the pipe running, like
+// Linux 6.1 intel_dp_retrain_link on a combo PHY (intel_ddi_prepare_link_retrain): DDI_BUF_CTL A
+// off, DP_TP_CTL A off with pattern 1, wait for DDI_BUF_IS_IDLE, DP_TP_CTL A on (pattern 1),
+// DDI_BUF_CTL A on, wait for the buffer; then clock recovery (TPS1, 100 us reads) and channel
+// equalisation (TPS3, TRAINING_AUX_RD_INTERVAL reads) through the native AUX path, DPCD
+// training pattern off, idle pattern (wait for DP_TP_STATUS idle done), normal pattern.
+// Only the training is repeated: the sink link configuration (0x100-0x101, 0x107-0x108,
+// 0x115) is left as the firmware wrote it, and the combo PHY drive levels are not touched,
+// so the sink is told the levels the firmware trained (DPCD 0x103-0x106). Pipe A FIFO
+// underrun and the PCH DDI A hotplug interrupts are masked while the link is down. A second
+// attempt runs if the first fails. Text result in debug.wexpsr.a1log, WEXG2A1 and the log.
+namespace A1 {
+constexpr uint32_t DDIBuf=0x64000,TPCtl=0x60540,TPStatus=0x60544,TransDDI=0x60400,TransDDI2=0x60404,
+    PipeIMR=0x44404,PipeIIR=0x44408,SDEIMR=0xC4004,SDEIIR=0xC4008,SDEIER=0xC400C,ShotplugDDI=0xC4030;
+constexpr uint32_t BufEnable=1U<<31,BufIdle=1U<<7,TPEnable=1U<<31,TPTrain=7U<<8,TPIdleDone=1U<<25;
+constexpr uint32_t Pat1=0U<<8,Idle=2U<<8,Normal=3U<<8,Pat3=4U<<8;
+static char text[2048];
+static size_t used=0;
+static volatile UInt32 busy=0;
+static uint32_t runs=0,lastResult=0;
+}
+#define A1LOG(...) do{if(A1::used<sizeof(A1::text)-1){const int n_=snprintf(A1::text+A1::used,sizeof(A1::text)-A1::used,__VA_ARGS__);\
+    if(n_>0)A1::used+=static_cast<size_t>(n_)<sizeof(A1::text)-1-A1::used ? static_cast<size_t>(n_) : sizeof(A1::text)-1-A1::used;}}while(0)
+static bool a1Aux(bool write,uint32_t address,uint8_t *data,uint32_t length) {
+    return XE::edpAuxRaw(write,address,data,length)==0;
+}
+static void a1Hex(const char *name,const uint8_t *d,unsigned n) {
+    A1LOG("%s=",name);for(unsigned i=0;i<n;++i)A1LOG("%02x",d[i]);A1LOG(" ");
+}
+static uint32_t a1Wait(uint32_t reg,uint32_t mask,bool set,uint32_t maxUs) {
+    uint32_t us=0;
+    while(((rd(reg)&mask)!=0)!=set && us<maxUs){IODelay(10);us+=10;}
+    return us;
+}
+static bool a1CR(const uint8_t *s){return (s[0]&0x11)==0x11 && (s[1]&0x11)==0x11;}
+static bool a1EQ(const uint8_t *s){return (s[0]&0x77)==0x77 && (s[1]&0x77)==0x77 && (s[2]&1);}
+// One training attempt; s = DPCD 0x202-0x207 after each read.
+static bool a1Attempt(unsigned attempt,uint32_t ddi0,uint32_t tp0,uint8_t level,uint32_t eqDelayMs) {
+    using namespace A1;
+    auto &c=display13FBPower;
+    uint8_t s[6] {};
+    IOLockLock(c.lock);
+    wr(DDIBuf,ddi0&~BufEnable);
+    wr(TPCtl,tp0&~(TPEnable|TPTrain));(void)rd(TPCtl);
+    const uint32_t idleUs=a1Wait(DDIBuf,BufIdle,true,10000);
+    wr(TPCtl,(tp0&~TPTrain)|TPEnable|Pat1);(void)rd(TPCtl);
+    wr(DDIBuf,ddi0|BufEnable);(void)rd(DDIBuf);
+    const uint32_t activeUs=a1Wait(DDIBuf,BufIdle,false,10000);
+    const uint32_t ddiOn=rd(DDIBuf),tpOn=rd(TPCtl);
+    IOLockUnlock(c.lock);
+    A1LOG("| try%u bufIdle=%uus bufActive=%uus ddi=%08x tp=%08x ",attempt,idleUs,activeUs,ddiOn,tpOn);
+    uint8_t set[5]={0x21,level,level,level,level};
+    bool ok=a1Aux(true,0x102,set,5),cr=false,eq=false;
+    unsigned crTries=0,eqTries=0;
+    while(ok && !cr && crTries<5) {
+        IODelay(100);++crTries;
+        if(!(ok=a1Aux(false,0x202,s,6)))break;
+        cr=a1CR(s);
+        if(!cr){a1Hex("crSt",s,6);ok=a1Aux(true,0x103,set+1,4);}
+    }
+    A1LOG("cr=%d/%u ",cr,crTries);
+    if(ok && cr) {
+        IOLockLock(c.lock);wr(TPCtl,(rd(TPCtl)&~TPTrain)|Pat3);(void)rd(TPCtl);IOLockUnlock(c.lock);
+        set[0]=0x23;
+        ok=a1Aux(true,0x102,set,5);
+        while(ok && !eq && eqTries<5) {
+            IOSleep(eqDelayMs);++eqTries;
+            if(!(ok=a1Aux(false,0x202,s,6)))break;
+            if(!a1CR(s)){a1Hex("eqLostCr",s,6);break;}
+            eq=a1EQ(s);
+            if(!eq){a1Hex("eqSt",s,6);ok=a1Aux(true,0x103,set+1,4);}
+        }
+        A1LOG("eq=%d/%u ",eq,eqTries);
+    }
+    uint8_t off=0;const bool offOk=a1Aux(true,0x102,&off,1);
+    IOLockLock(c.lock);
+    wr(TPCtl,(rd(TPCtl)&~TPTrain)|Idle);
+    const uint32_t idleDoneUs=a1Wait(TPStatus,TPIdleDone,true,2000);
+    wr(TPCtl,(rd(TPCtl)&~TPTrain)|Normal);
+    const uint32_t tpEnd=rd(TPCtl),tpsEnd=rd(TPStatus);
+    IOLockUnlock(c.lock);
+    a1Hex("lastSt",s,6);
+    A1LOG("aux=%d patOff=%d idleDone=%uus tp=%08x tps=%08x ",ok,offOk,idleDoneUs,tpEnd,tpsEnd);
+    return ok && cr && eq;
+}
+static int a1Run() {
+    using namespace A1;
+    auto &c=display13FBPower;
+    if(!map || !c.lock || map->getLength()<ShotplugDDI+4)return ENODEV;
+    used=0;text[0]=0;
+    const uint32_t ddi0=rd(DDIBuf),tp0=rd(TPCtl),tps0=rd(TPStatus),trans=rd(TransDDI);
+    A1LOG("run=%u ddi=%08x tp=%08x tps=%08x trans=%08x ctl2=%08x dss=%08x/%08x plane=%08x pipeImr=%08x sdeImr=%08x sdeIer=%08x shotplug=%08x ",
+        runs,ddi0,tp0,tps0,trans,rd(TransDDI2),rd(0x78000),rd(0x78004),rd(0x70180),rd(PipeIMR),rd(SDEIMR),rd(SDEIER),rd(ShotplugDDI));
+    uint8_t caps[16] {},rates[16] {},cfg[16] {},cfg2[16] {},st[8] {};
+    if(!a1Aux(false,0x000,caps,16) || !a1Aux(false,0x010,rates,16) || !a1Aux(false,0x100,cfg,16) ||
+       !a1Aux(false,0x110,cfg2,16) || !a1Aux(false,0x200,st,8)){A1LOG("result=aux-read-failed");return EIO;}
+    a1Hex("raw000",caps,16);a1Hex("raw010",rates,16);a1Hex("raw100",cfg,16);a1Hex("raw110",cfg2,16);a1Hex("st200",st,8);
+    const uint8_t level=cfg[3];
+    const bool regsOk=(ddi0&(BufEnable|BufIdle|(7U<<1)))==(BufEnable|(3U<<1)) &&
+        (tp0&(TPEnable|(1U<<27)|TPTrain))==(TPEnable|Normal) &&
+        (trans&(1U<<31)) && ((trans>>27)&0xF)==1 && ((trans>>24)&7)==2;
+    const bool sinkOk=(cfg[1]&0x1F)==4 && cfg[4]==level && cfg[5]==level && cfg[6]==level && !(level&0xE4) && a1EQ(st+2);
+    if(!regsOk || !sinkOk){A1LOG("result=precondition regs=%d sink=%d",regsOk,sinkOk);return EBUSY;}
+    const uint32_t interval=caps[0x0E]&0x7F;
+    const uint32_t eqDelayMs=interval ? (interval>4 ? 16 : 4*interval) : 1;
+    // Mask pipe A FIFO underrun and the PCH DDI A hotplug while the link is down.
+    IOLockLock(c.lock);
+    const uint32_t pipeImr=rd(PipeIMR),sdeImr=rd(SDEIMR);
+    wr(PipeIMR,pipeImr|(1U<<31));wr(SDEIMR,sdeImr|(1U<<16));(void)rd(SDEIMR);
+    IOLockUnlock(c.lock);
+    uint64_t t0=mach_absolute_time();
+    bool ok=a1Attempt(1,ddi0,tp0,level,eqDelayMs);
+    if(!ok)ok=a1Attempt(2,ddi0,tp0,level,eqDelayMs);
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-t0,&ns);
+    IOSleep(20);
+    IOLockLock(c.lock);
+    const uint32_t pipeIir=rd(PipeIIR),sdeIir=rd(SDEIIR);
+    if(!(pipeImr&(1U<<31))){wr(PipeIIR,1U<<31);wr(PipeIMR,rd(PipeIMR)&~(1U<<31));}
+    if(!(sdeImr&(1U<<16)))wr(SDEIMR,rd(SDEIMR)&~(1U<<16));
+    const uint32_t ddi1=rd(DDIBuf),tp1=rd(TPCtl),tps1=rd(TPStatus),shot1=rd(ShotplugDDI);
+    IOLockUnlock(c.lock);
+    uint8_t st1[8] {};const bool after=a1Aux(false,0x200,st1,8);
+    A1LOG("| linkDown=%llums pipeIir=%08x sdeIir=%08x ddi=%08x tp=%08x tps=%08x shotplug=%08x ",ns/1000000ULL,pipeIir,sdeIir,ddi1,tp1,tps1,shot1);
+    if(after)a1Hex("st200after",st1,8);
+    const bool good=ok && after && a1EQ(st1+2);
+    A1LOG("result=%s",good ? "ok" : "FAILED");
+    return good ? 0 : EIO;
+}
+static int a1Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=static_cast<int>(A1::runs);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=1)return EINVAL;
+    if(!OSCompareAndSwap(0,1,&A1::busy))return EBUSY;
+    ++A1::runs;
+    const int result=a1Run();
+    A1::lastResult=static_cast<uint32_t>(result);
+    IOLog("WEXG2A1 %s\n",A1::text);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXG2A1",A1::text);
+    OSCompareAndSwap(1,0,&A1::busy);
+    return result;
+}
+static int a1LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    return sysctl_handle_string(oidp,A1::text,sizeof(A1::text),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a1, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a1Handler, "I", "1 retrains the eDP link (G phase 2 step A1)");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a1log, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a1LogHandler, "A", "last A1 result");
 // Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
 // write debug.wexpsr.addr, then read or write debug.wexpsr.val.
 static int peekAddr=0x70180;
@@ -8296,6 +8457,8 @@ static void install(IOMemoryMap *m) {
     pwOffCall=thread_call_allocate(pwOffWork,nullptr);
     sysctl_register_oid(&sysctl__debug_wexpsr_pmc);
     sysctl_register_oid(&sysctl__debug_wexpsr_g1b);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a1);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a1log);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
     sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();

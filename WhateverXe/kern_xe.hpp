@@ -54,6 +54,7 @@ public:
 	void init();
 	// eDP PSR1 experiment (debug.wexpsr): seconds>0 enable with auto-off, -1 enable, 0 disable.
 	static int edpPSRRequest(int seconds);
+	static uint32_t edpAuxRaw(bool write,uint32_t address,void *data,uint32_t length);
 	static void edpPSRDisableTimed();
     void captureFirmware(IOPCIDevice *,const XELP::Profile &);
     void selectProfile(const XELP::Profile &profile);
