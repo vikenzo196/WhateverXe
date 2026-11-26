@@ -8884,8 +8884,8 @@ static uint32_t core0[4];
 // with the pipe off, skipping read-only/status registers and the LUT index/data windows; the LUTs (10-bit gamma
 // PAL_PREC, 1024 entries; pre-CSC degamma, 131 entries on display 13) go through their auto-increment windows.
 struct PwaRange { uint32_t start,dwords; };
-constexpr PwaRange PwaRanges[6]={{0x60000,64},{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,128}};
-constexpr uint32_t PwaDwords=64+1024+1024+128+320+128;
+constexpr PwaRange PwaRanges[7]={{0x60000,64},{0x60200,128},{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,256}};
+constexpr uint32_t PwaDwords=64+128+1024+1024+128+320+256;
 
 static uint32_t pwaSave[PwaDwords];
 static uint32_t gammaSave[1024],degammaSave[131];
@@ -8924,6 +8924,8 @@ static void pwaRestoreAll() {
     for(const auto &g:PwaRanges)for(uint32_t i=0;i<g.dwords;++i,++k) {
         const uint32_t r=g.start+4*i;
         if(pwaSkip(r)){++pwaSkips;continue;}
+        // DSC (0x78000-0x783FC) is written in full like intel_dsc_pps_configure, the rest only where it changed.
+        if(r>=0x78000 && r<0x78400){if(r!=0x78000 && r!=0x78004){wr(r,pwaSave[k]);++pwaWrites;}continue;}
         if(rd(r)!=pwaSave[k]){wr(r,pwaSave[k]);++pwaWrites;}
     }
     wr(0x4A400,1U<<15);for(auto v:gammaSave)wr(0x4A404,v);
@@ -9065,7 +9067,8 @@ static void g5Dc6Enter() {
     for(auto req:PwReqs)if(rd(PwCtl)&req){wr(PwCtl,rd(PwCtl)&~req);dc6Dropped|=req;(void)g5WaitBit(PwCtl,req>>1,false,1000);}
     bc(0x12);
     dc6Aux=rd(AuxCtl2)&2U;if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)&~2U);(void)g5WaitBit(AuxCtl2,1U,false,1000);}
-    dc6Ddi=rd(DdiCtl2)&2U;if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)&~2U);(void)g5WaitBit(DdiCtl2,1U,false,1000);}
+    // DDI IO A stays requested: Linux keeps it with the port, and the DMC keeps the port A PHY context across DC states.
+    dc6Ddi=0;
     A1LOG("released=%08x pw=%08x aux=%08x ddi=%08x ",dc6Dropped,rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2));
     bc(0x13);
     if(dc6Mode==1){writeDCState(2);bc(0x14);}
@@ -9223,6 +9226,36 @@ static int dumpHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req
         u+=static_cast<size_t>(snprintf(dumpText+u,sizeof(dumpText)-u,"%x=%x,",b+4*i,rd(b+4*i)));
     return sysctl_handle_string(oidp,dumpText,sizeof(dumpText),req);
 }
+// PCI config access for package C-state experiments: debug.wexpsr.pcisel = bus<<16 | dev<<11 | fn<<8 | (offset/4),
+// debug.wexpsr.pcival reads/writes that config dword.
+static int pciSel=0;
+static IOPCIDevice *pciFind(uint32_t bus,uint32_t dev,uint32_t fn) {
+    IOPCIDevice *found=nullptr;
+    OSIterator *it=IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+    if(!it)return nullptr;
+    while(auto *d=OSDynamicCast(IOPCIDevice,it->getNextObject()))
+        if(d->getBusNumber()==bus && d->getDeviceNumber()==dev && d->getFunctionNumber()==fn){found=d;break;}
+    it->release();
+    return found;
+}
+static int pciSelHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=pciSel;const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    pciSel=value;return 0;
+}
+static int pciValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    const uint32_t sel=static_cast<uint32_t>(pciSel);
+    IOPCIDevice *d=pciFind((sel>>16)&0xFF,(sel>>11)&0x1F,(sel>>8)&7);
+    if(!d)return ENODEV;
+    const uint8_t off=static_cast<uint8_t>((sel&0x3F)*4);
+    int value=static_cast<int>(d->configRead32(off));
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    d->configWrite32(off,static_cast<uint32_t>(value));
+    return 0;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pcisel, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pciSelHandler, "I", "bus<<16|dev<<11|fn<<8|dword");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pcival, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pciValHandler, "I", "PCI config dword at pcisel");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dumpbase, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dumpBaseHandler, "I", "base of debug.wexpsr.dump");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dump, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, dumpHandler, "A", "256 display registers from dumpbase");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, cmos, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, cmosHandler, "A", "CMOS bytes 0x00-0xFF (read only)");
@@ -9290,6 +9323,8 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+    sysctl_register_oid(&sysctl__debug_wexpsr_pcisel);
+    sysctl_register_oid(&sysctl__debug_wexpsr_pcival);
     sysctl_register_oid(&sysctl__debug_wexpsr_dump);
     sysctl_register_oid(&sysctl__debug_wexpsr_bcofs);
     sysctl_register_oid(&sysctl__debug_wexpsr_tco);
