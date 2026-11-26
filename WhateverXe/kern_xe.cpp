@@ -9354,6 +9354,35 @@ static int irtlHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req
     ml_set_interrupts_enabled(ints);
     return 0;
 }
+// Per-CPU core C6/C7 residency (MSR 0x3FD, 0x3FE, architectural on ADL) and TSC, read on every CPU through
+// mp_rendezvous_no_intrs: before/after a sleep it shows whether the other CPUs sat in a deep core C-state while the
+// boot CPU waited. "apicid:c6,c7,tsc;" in hex.
+extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
+static uint64_t coreRes[64][3];
+static uint32_t coreApic[64];
+static volatile uint32_t coreSlot=0;
+static void coreResOne(void *) {
+    const uint32_t n=__atomic_fetch_add(&coreSlot,1,__ATOMIC_ACQ_REL);
+    if(n>=64)return;
+    uint32_t a,b,c,d;asm volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0xBU),"c"(0U));coreApic[n]=d;
+    uint32_t lo,hi;
+    asm volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(0x3FDU));coreRes[n][0]=(static_cast<uint64_t>(hi)<<32)|lo;
+    asm volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(0x3FEU));coreRes[n][1]=(static_cast<uint64_t>(hi)<<32)|lo;
+    asm volatile("rdtsc":"=a"(lo),"=d"(hi));coreRes[n][2]=(static_cast<uint64_t>(hi)<<32)|lo;
+}
+static char coreResText[64*60];
+static int coreResHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    uint32_t lo=0,hi=0;
+    if(::xePmRdmsrCarefully(0x3FE,&lo,&hi) || ::xePmRdmsrCarefully(0x3FD,&lo,&hi))return ENXIO;
+    bzero(coreRes,sizeof(coreRes));
+    __atomic_store_n(&coreSlot,0U,__ATOMIC_RELEASE);
+    mp_rendezvous_no_intrs(coreResOne,nullptr);
+    size_t u=0;
+    for(unsigned i=0;i<64 && u+60<sizeof(coreResText);++i)if(coreRes[i][2])
+        u+=static_cast<size_t>(snprintf(coreResText+u,sizeof(coreResText)-u,"%x:%llx,%llx,%llx;",coreApic[i],coreRes[i][0],coreRes[i][1],coreRes[i][2]));
+    return sysctl_handle_string(oidp,coreResText,sizeof(coreResText),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, coreres, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, coreResHandler, "A", "per-CPU core C6/C7 residency and TSC");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, irtl, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, irtlHandler, "I", "write the IRTL MSR selected by msraddr");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, msraddr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, msrAddrHandler, "IU", "MSR for msrval");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, msrval, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, msrValHandler, "A", "MSR at msraddr (read only)");
@@ -9439,6 +9468,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+    sysctl_register_oid(&sysctl__debug_wexpsr_coreres);
     sysctl_register_oid(&sysctl__debug_wexpsr_irtl);
     sysctl_register_oid(&sysctl__debug_wexpsr_msraddr);
     sysctl_register_oid(&sysctl__debug_wexpsr_msrval);
