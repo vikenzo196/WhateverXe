@@ -8286,7 +8286,75 @@ static uint32_t runs=0,lastResult=0;
 }
 #define A1LOG(...) do{if(A1::used<sizeof(A1::text)-1){const int n_=snprintf(A1::text+A1::used,sizeof(A1::text)-A1::used,__VA_ARGS__);\
     if(n_>0)A1::used+=static_cast<size_t>(n_)<sizeof(A1::text)-1-A1::used ? static_cast<size_t>(n_) : sizeof(A1::text)-1-A1::used;}}while(0)
+// G5 (A5): the same sequences inside S0ixSleep's wait hook (interrupts off, one CPU, every driver asleep).
+// gRaw selects that mode: no locks, busy waits instead of IOSleep, and AUX transactions driven directly on
+// DDI_AUX_CTL_A like Linux intel_dp_aux_xfer / skl_get_aux_send_ctl (polled, no done interrupt, the 18/32
+// fast-wake/sync pulse counts the donor also uses), with drm_dp_dpcd_access-style retries on defer.
+static bool gRaw=false;
+static inline void lk(){if(!gRaw)IOLockLock(display13FBPower.lock);}
+static inline void ulk(){if(!gRaw)IOLockUnlock(display13FBPower.lock);}
+static void msl(uint32_t ms){if(!gRaw){IOSleep(ms);return;}for(uint32_t i=0;i<ms;++i)IODelay(1000);}
+namespace G5 {
+constexpr uint32_t AuxCtl=0x64010,AuxData=0x64014;
+constexpr uint32_t SendBusy=1U<<31,Done=1U<<30,Timeout=1U<<28,TimeoutMax=3U<<26,RecvErr=1U<<25,SizeShift=20,SizeMask=0x1FU<<20;
+constexpr uint32_t SyncPulses=(17U<<5)|31U;
+static uint32_t auxXfers=0,auxRetries=0,auxFails=0;
+}
+static int g5AuxXfer(const uint8_t *tx,uint32_t txLen,uint8_t *rx,uint32_t rxLen) {
+    using namespace G5;
+    for(unsigned i=0;i<30 && (rd(AuxCtl)&SendBusy);++i)IODelay(100);
+    if(rd(AuxCtl)&SendBusy)return -1;
+    for(unsigned attempt=0;attempt<5;++attempt) {
+        ++auxXfers;
+        for(uint32_t i=0;i<txLen;i+=4) {
+            uint32_t v=0;
+            for(uint32_t b=0;b<4 && i+b<txLen;++b)v|=static_cast<uint32_t>(tx[i+b])<<((3-b)*8);
+            wr(AuxData+i,v);
+        }
+        wr(AuxCtl,SendBusy|Done|Timeout|TimeoutMax|RecvErr|(txLen<<SizeShift)|SyncPulses);
+        uint32_t status=0,us=0;
+        while(((status=rd(AuxCtl))&SendBusy) && us<10000){IODelay(10);us+=10;}
+        if(status&SendBusy)return -1;
+        wr(AuxCtl,status|Done|Timeout|RecvErr);
+        if(status&Timeout)continue;
+        if(status&RecvErr){IODelay(500);continue;}
+        if(status&Done) {
+            uint32_t n=(status&SizeMask)>>SizeShift;
+            if(!n || n>20)return -1;
+            if(n>rxLen)n=rxLen;
+            for(uint32_t i=0;i<n;i+=4) {
+                const uint32_t v=rd(AuxData+i);
+                for(uint32_t b=0;b<4 && i+b<n;++b)rx[i+b]=static_cast<uint8_t>(v>>((3-b)*8));
+            }
+            return static_cast<int>(n);
+        }
+    }
+    return -1;
+}
+static bool g5Aux(bool write,uint32_t address,uint8_t *data,uint32_t length) {
+    if(!data || !length || length>16)return false;
+    uint8_t tx[20] {},rx[20] {};
+    tx[0]=static_cast<uint8_t>(((write ? 0x8U : 0x9U)<<4)|((address>>16)&0xFU));
+    tx[1]=static_cast<uint8_t>(address>>8);tx[2]=static_cast<uint8_t>(address);tx[3]=static_cast<uint8_t>(length-1);
+    uint32_t txLen=4;
+    if(write){memcpy(tx+4,data,length);txLen+=length;}
+    for(unsigned retry=0;retry<32;++retry) {
+        const int n=g5AuxXfer(tx,txLen,rx,write ? 1 : length+1);
+        if(n<1){++G5::auxRetries;IODelay(500);continue;}
+        const uint8_t reply=(rx[0]>>4)&3;
+        if(reply==0) {
+            if(write)return true;
+            if(static_cast<uint32_t>(n)<length+1){++G5::auxFails;return false;}
+            memcpy(data,rx+1,length);return true;
+        }
+        if(reply==1){++G5::auxFails;return false;}
+        ++G5::auxRetries;IODelay(500);
+    }
+    ++G5::auxFails;
+    return false;
+}
 static bool a1Aux(bool write,uint32_t address,uint8_t *data,uint32_t length) {
+    if(gRaw)return g5Aux(write,address,data,length);
     return XE::edpAuxRaw(write,address,data,length)==0;
 }
 static void a1Hex(const char *name,const uint8_t *d,unsigned n) {
@@ -8302,9 +8370,8 @@ static bool a1EQ(const uint8_t *s){return (s[0]&0x77)==0x77 && (s[1]&0x77)==0x77
 // One training attempt; s = DPCD 0x202-0x207 after each read.
 static bool a1Attempt(unsigned attempt,uint32_t ddi0,uint32_t tp0,uint8_t level,uint32_t eqDelayMs) {
     using namespace A1;
-    auto &c=display13FBPower;
     uint8_t s[6] {};
-    IOLockLock(c.lock);
+    lk();
     wr(DDIBuf,ddi0&~BufEnable);
     wr(TPCtl,tp0&~(TPEnable|TPTrain));(void)rd(TPCtl);
     const uint32_t idleUs=a1Wait(DDIBuf,BufIdle,true,10000);
@@ -8312,7 +8379,7 @@ static bool a1Attempt(unsigned attempt,uint32_t ddi0,uint32_t tp0,uint8_t level,
     wr(DDIBuf,ddi0|BufEnable);(void)rd(DDIBuf);
     const uint32_t activeUs=a1Wait(DDIBuf,BufIdle,false,10000);
     const uint32_t ddiOn=rd(DDIBuf),tpOn=rd(TPCtl);
-    IOLockUnlock(c.lock);
+    ulk();
     A1LOG("| try%u bufIdle=%uus bufActive=%uus ddi=%08x tp=%08x ",attempt,idleUs,activeUs,ddiOn,tpOn);
     uint8_t set[5]={0x21,level,level,level,level};
     bool ok=a1Aux(true,0x102,set,5),cr=false,eq=false;
@@ -8325,11 +8392,11 @@ static bool a1Attempt(unsigned attempt,uint32_t ddi0,uint32_t tp0,uint8_t level,
     }
     A1LOG("cr=%d/%u ",cr,crTries);
     if(ok && cr) {
-        IOLockLock(c.lock);wr(TPCtl,(rd(TPCtl)&~TPTrain)|Pat3);(void)rd(TPCtl);IOLockUnlock(c.lock);
+        lk();wr(TPCtl,(rd(TPCtl)&~TPTrain)|Pat3);(void)rd(TPCtl);ulk();
         set[0]=0x23;
         ok=a1Aux(true,0x102,set,5);
         while(ok && !eq && eqTries<5) {
-            IOSleep(eqDelayMs);++eqTries;
+            msl(eqDelayMs);++eqTries;
             if(!(ok=a1Aux(false,0x202,s,6)))break;
             if(!a1CR(s)){a1Hex("eqLostCr",s,6);break;}
             eq=a1EQ(s);
@@ -8338,12 +8405,12 @@ static bool a1Attempt(unsigned attempt,uint32_t ddi0,uint32_t tp0,uint8_t level,
         A1LOG("eq=%d/%u ",eq,eqTries);
     }
     uint8_t off=0;const bool offOk=a1Aux(true,0x102,&off,1);
-    IOLockLock(c.lock);
+    lk();
     wr(TPCtl,(rd(TPCtl)&~TPTrain)|Idle);
     const uint32_t idleDoneUs=a1Wait(TPStatus,TPIdleDone,true,2000);
     wr(TPCtl,(rd(TPCtl)&~TPTrain)|Normal);
     const uint32_t tpEnd=rd(TPCtl),tpsEnd=rd(TPStatus);
-    IOLockUnlock(c.lock);
+    ulk();
     a1Hex("lastSt",s,6);
     A1LOG("aux=%d patOff=%d idleDone=%uus tp=%08x tps=%08x ",ok,offOk,idleDoneUs,tpEnd,tpsEnd);
     return ok && cr && eq;
@@ -8430,14 +8497,14 @@ static uint32_t runs=0;
 }
 static uint32_t a2WaitPP(uint32_t mask,uint32_t value,uint32_t maxMs) {
     uint32_t ms=0;
-    while((rd(A2::PPStatus)&mask)!=value && ms<maxMs){IOSleep(5);ms+=5;}
+    while((rd(A2::PPStatus)&mask)!=value && ms<maxMs){msl(5);ms+=5;}
     return ms;
 }
 static uint64_t a2Ms(uint64_t t0) {
     uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-t0,&ns);return ns/1000000ULL;
 }
 static bool a2AuxRetry(bool write,uint32_t address,uint8_t *data,uint32_t length) {
-    for(unsigned i=0;i<3;++i){if(a1Aux(write,address,data,length))return true;IOSleep(1);}
+    for(unsigned i=0;i<3;++i){if(a1Aux(write,address,data,length))return true;msl(1);}
     return false;
 }
 // A3 (chain=true) adds, like Linux intel_disable_ddi / intel_ddi_post_disable and hsw_crtc_enable /
@@ -8457,7 +8524,7 @@ static uint32_t runs=0;
 }
 static uint32_t a3WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxMs) {
     uint32_t ms=0;
-    while(((rd(reg)&mask)!=0)!=set && ms<maxMs){IOSleep(1);++ms;}
+    while(((rd(reg)&mask)!=0)!=set && ms<maxMs){msl(1);++ms;}
     return ms;
 }
 // A4 (pll=true, implies chain and cmtgOff: the ADL-P CMTG runs on the DPLL0 clock) also stops the port
@@ -8476,16 +8543,27 @@ static uint32_t a4WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxUs) {
     while(((rd(reg)&mask)!=0)!=set && us<maxUs){IODelay(10);us+=10;}
     return us;
 }
-static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=false) {
+// Chain state saved by g2Off (the way down) for g2On (the way up): A2-A4 run both back to back,
+// A5 runs them in S0ixSleep's enter and exit hooks.
+struct G2State {
+    bool chain,cmtgOff,pll,active;
+    uint8_t level,cfg[16],cfg2[16],dsc[16],oui[16],intel[16],bl[16];
+    uint32_t ddi0,tp0,trans,ppc0,eqDelayMs,t8,conf0,clk0,ctl20,dss10,dss20,cur0,curBase0,planeCtl0[5],planeSurf0[5];
+    uint32_t dpclka0,cfgcr00,cfgcr10,div00,pipeImr,sdeImr;
+    uint64_t t0,offAt;
+};
+static G2State g2s {};
+static int g2Off(bool chain,bool cmtgOff,bool pll) {
     if(pll)chain=cmtgOff=true;
     using namespace A1;
     auto &c=display13FBPower;
-    if(!map || !c.lock || map->getLength()<ShotplugDDI+4)return ENODEV;
+    if(!map || (!gRaw && !c.lock) || map->getLength()<ShotplugDDI+4)return ENODEV;
+    g2s.active=false;
     used=0;text[0]=0;
     const uint32_t ddi0=rd(DDIBuf),tp0=rd(TPCtl),trans=rd(TransDDI),pps0=rd(A2::PPStatus),ppc0=rd(A2::PPControl);
     const uint32_t onDelays=rd(A2::PPOnDelays),offDelays=rd(A2::PPOffDelays);
     A1LOG("A2 run=%u off=%ums ddi=%08x tp=%08x trans=%08x pps=%08x ppc=%08x on=%08x offd=%08x gate=%08x sdeImr=%08x shotplug=%08x ",
-        A2::runs,offMs,ddi0,tp0,trans,pps0,ppc0,onDelays,offDelays,rd(A2::ClockGate),rd(SDEIMR),rd(ShotplugDDI));
+        A2::runs,0U,ddi0,tp0,trans,pps0,ppc0,onDelays,offDelays,rd(A2::ClockGate),rd(SDEIMR),rd(ShotplugDDI));
     uint8_t caps[16] {},cfg[16] {},cfg2[16] {},dsc[16] {},oui[16] {},intel[16] {},bl[16] {},st[8] {},pw=0;
     if(!a1Aux(false,0x000,caps,16) || !a1Aux(false,0x100,cfg,16) || !a1Aux(false,0x110,cfg2,16) || !a1Aux(false,0x160,dsc,16) ||
        !a1Aux(false,0x300,oui,16) || !a1Aux(false,0x340,intel,16) || !a1Aux(false,0x720,bl,16) || !a1Aux(false,0x200,st,8) ||
@@ -8515,66 +8593,89 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=fal
     const uint32_t eqDelayMs=interval ? (interval>4 ? 16 : 4*interval) : 1;
     const uint32_t t9=(offDelays&0x1FFF)/10,t8=(onDelays&0x1FFF)/10;
     const uint64_t t0=mach_absolute_time();
-    IOLockLock(c.lock);
+    lk();
     const uint32_t pipeImr=rd(PipeIMR),sdeImr=rd(SDEIMR);
     wr(PipeIMR,pipeImr|(1U<<31));wr(SDEIMR,sdeImr|(1U<<16));(void)rd(SDEIMR);
-    IOLockUnlock(c.lock);
+    ulk();
     // 1. Backlight off: DPCD enable, then the PPS backlight and T9.
     if(bl[0]&1){uint8_t v=bl[0]&~1;a1Aux(true,0x720,&v,1);}
-    IOLockLock(c.lock);wr(A2::PPControl,rd(A2::PPControl)&~A2::BLC);(void)rd(A2::PPControl);IOLockUnlock(c.lock);
-    IOSleep(t9);
+    lk();wr(A2::PPControl,rd(A2::PPControl)&~A2::BLC);(void)rd(A2::PPControl);ulk();
+    msl(t9);
     if(chain) {
         // A3: planes and cursor off, pipe off, transcoder function off, DSC off.
-        IOLockLock(c.lock);
+        lk();
         for(unsigned i=0;i<5;++i)if(planeCtl0[i]&(1U<<31)){wr(A3::PlaneCtl[i],0);wr(A3::PlaneSurf[i],0);}
         if(cur0&0x27U){wr(A3::CurCntr,0);wr(A3::CurBase,0);}
-        IOLockUnlock(c.lock);
-        IOSleep(20);
-        IOLockLock(c.lock);wr(A3::TransConf,conf0&~(1U<<31));(void)rd(A3::TransConf);IOLockUnlock(c.lock);
+        ulk();
+        msl(20);
+        lk();wr(A3::TransConf,conf0&~(1U<<31));(void)rd(A3::TransConf);ulk();
         const uint32_t pipeOffMs=a3WaitBit(A3::TransConf,1U<<30,false,100);
-        IOLockLock(c.lock);
+        lk();
         wr(TransDDI2,0);
         wr(TransDDI,trans&~((1U<<31)|(0xFU<<27)|(7U<<24)));(void)rd(TransDDI);
-        IOLockUnlock(c.lock);
+        ulk();
         uint32_t cmtgMs=0;
         if(cmtgOff) {
-            IOLockLock(c.lock);wr(A3::CmtgGB1,rd(A3::CmtgGB1)&~(1U<<31));wr(A3::CmtgCtl,rd(A3::CmtgCtl)&~(1U<<31));IOLockUnlock(c.lock);
+            lk();wr(A3::CmtgGB1,rd(A3::CmtgGB1)&~(1U<<31));wr(A3::CmtgCtl,rd(A3::CmtgCtl)&~(1U<<31));ulk();
             cmtgMs=a3WaitBit(A3::CmtgCtl,1U<<23,false,50);
         }
-        IOLockLock(c.lock);wr(A3::DSS1,0);wr(A3::DSS2,0);(void)rd(A3::DSS2);IOLockUnlock(c.lock);
+        lk();wr(A3::DSS1,0);wr(A3::DSS2,0);(void)rd(A3::DSS2);ulk();
         A1LOG("| pipeOff=%ums conf=%08x trans=%08x ctl2=%08x cmtg=%08x cmtgMs=%u dss=%08x/%08x frame=%u ",pipeOffMs,rd(A3::TransConf),
             rd(TransDDI),rd(TransDDI2),rd(A3::CmtgCtl),cmtgMs,rd(A3::DSS1),rd(A3::DSS2),rd(A3::FrameCount));
     }
     // 2. Sink D3, link off.
     uint8_t d3=2;const bool d3Ok=a1Aux(true,0x600,&d3,1);
-    IOLockLock(c.lock);
+    lk();
     wr(DDIBuf,ddi0&~BufEnable);
     wr(TPCtl,tp0&~(TPEnable|TPTrain));(void)rd(TPCtl);
     const uint32_t idleUs=a1Wait(DDIBuf,BufIdle,true,10000);
     if(chain)wr(A3::TransClkSel,0);
     // 3. Panel power off.
     wr(A2::PPControl,rd(A2::PPControl)&~(A2::PowerOn|A2::PowerReset|A2::ForceVdd|A2::BLC));(void)rd(A2::PPControl);
-    IOLockUnlock(c.lock);
+    ulk();
     const uint32_t offWait=a2WaitPP(A2::PPOn|A2::PPSeq,0,5000);
     const uint64_t offAt=mach_absolute_time();
     if(pll) {
-        IOLockLock(c.lock);
+        lk();
         wr(A4::DPCLKA,rd(A4::DPCLKA)|A4::ClkOffA);(void)rd(A4::DPCLKA);
         wr(A4::PllEnable,rd(A4::PllEnable)&~A4::PllOn);
         const uint32_t unlockUs=a4WaitBit(A4::PllEnable,A4::PllLock,false,1000);
         wr(A4::PllEnable,rd(A4::PllEnable)&~A4::PllPower);
         const uint32_t powerOffUs=a4WaitBit(A4::PllEnable,A4::PllPowerState,false,1000);
         const uint32_t dpclkaOff=rd(A4::DPCLKA),pllOff=rd(A4::PllEnable);
-        IOLockUnlock(c.lock);
+        ulk();
         A1LOG("| A4off unlock=%uus powerOff=%uus dpclka=%08x pll=%08x ",unlockUs,powerOffUs,dpclkaOff,pllOff);
     }
     const uint32_t ppsOff=rd(A2::PPStatus);
     A1LOG("| d3=%d bufIdle=%uus offWait=%ums ppsOff=%08x t=%llums ",d3Ok,idleUs,offWait,ppsOff,a2Ms(t0));
-    // 4. Stay off, then wait for the power cycle delay to expire.
-    IOSleep(offMs);
+    // Saved for g2On.
+    auto &S=g2s;
+    S.chain=chain;S.cmtgOff=cmtgOff;S.pll=pll;
+    S.ddi0=ddi0;S.tp0=tp0;S.trans=trans;S.ppc0=ppc0;S.level=level;S.eqDelayMs=eqDelayMs;S.t8=t8;
+    memcpy(S.cfg,cfg,16);memcpy(S.cfg2,cfg2,16);memcpy(S.dsc,dsc,16);memcpy(S.oui,oui,16);memcpy(S.intel,intel,16);memcpy(S.bl,bl,16);
+    S.conf0=conf0;S.clk0=clk0;S.ctl20=ctl20;S.dss10=dss10;S.dss20=dss20;S.cur0=cur0;S.curBase0=curBase0;
+    memcpy(S.planeCtl0,planeCtl0,sizeof(planeCtl0));memcpy(S.planeSurf0,planeSurf0,sizeof(planeSurf0));
+    S.dpclka0=dpclka0;S.cfgcr00=cfgcr00;S.cfgcr10=cfgcr10;S.div00=div00;
+    S.pipeImr=pipeImr;S.sdeImr=sdeImr;S.t0=t0;S.offAt=offAt;
+    S.active=true;
+    return 0;
+}
+static int g2On() {
+    using namespace A1;
+    auto &S=g2s;
+    if(!map || !S.active)return ENOENT;
+    S.active=false;
+    const bool chain=S.chain,pll=S.pll;
+    const uint32_t ddi0=S.ddi0,tp0=S.tp0,trans=S.trans,ppc0=S.ppc0,eqDelayMs=S.eqDelayMs,t8=S.t8;
+    const uint8_t level=S.level;
+    uint8_t *cfg=S.cfg,*cfg2=S.cfg2,*dsc=S.dsc,*oui=S.oui,*intel=S.intel,*bl=S.bl;
+    const uint32_t conf0=S.conf0,clk0=S.clk0,ctl20=S.ctl20,dss10=S.dss10,dss20=S.dss20,cur0=S.cur0,curBase0=S.curBase0;
+    const uint32_t *planeCtl0=S.planeCtl0,*planeSurf0=S.planeSurf0;
+    const uint32_t dpclka0=S.dpclka0,cfgcr00=S.cfgcr00,cfgcr10=S.cfgcr10,div00=S.div00,pipeImr=S.pipeImr,sdeImr=S.sdeImr;
+    const uint64_t t0=S.t0,offAt=S.offAt;
     const uint32_t cycleWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPCycle|A2::PPState,0,5000);
     if(pll) {
-        IOLockLock(c.lock);
+        lk();
         wr(A4::PllEnable,rd(A4::PllEnable)|A4::PllPower);
         const uint32_t powerOnUs=a4WaitBit(A4::PllEnable,A4::PllPowerState,true,1000);
         const uint32_t rst0=rd(A4::Cfgcr0),rst1=rd(A4::Cfgcr1),rstDiv=rd(A4::Div0);
@@ -8583,26 +8684,26 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=fal
         wr(A4::PllEnable,rd(A4::PllEnable)|A4::PllOn);
         const uint32_t lockUs=a4WaitBit(A4::PllEnable,A4::PllLock,true,1000);
         const uint32_t pllOn=rd(A4::PllEnable);
-        IOLockUnlock(c.lock);
+        ulk();
         A1LOG("| A4on powerOn=%uus reset=%08x/%08x/%08x lock=%uus pll=%08x ",powerOnUs,rst0,rst1,rstDiv,lockUs,pllOn);
     }
     // 5. Panel power on (display 13: DPLS unit clock gating off meanwhile).
-    IOLockLock(c.lock);
+    lk();
     wr(A2::ClockGate,rd(A2::ClockGate)|A2::DPLSGate);
     wr(A2::PPControl,(ppc0&~A2::BLC)|A2::PowerOn|(ppc0&A2::PowerReset));(void)rd(A2::PPControl);
-    IOLockUnlock(c.lock);
+    ulk();
     const uint32_t onWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPState,A2::PPOn|A2::PPStateOnIdle,5000);
     const uint64_t onAt=mach_absolute_time();
-    IOLockLock(c.lock);wr(A2::ClockGate,rd(A2::ClockGate)&~A2::DPLSGate);IOLockUnlock(c.lock);
+    lk();wr(A2::ClockGate,rd(A2::ClockGate)&~A2::DPLSGate);ulk();
     if(pll) {
-        IOLockLock(c.lock);
+        lk();
         wr(A4::DPCLKA,(rd(A4::DPCLKA)&~A4::ClkSelA)|(dpclka0&A4::ClkSelA));(void)rd(A4::DPCLKA);
         wr(A4::DPCLKA,rd(A4::DPCLKA)&~A4::ClkOffA);(void)rd(A4::DPCLKA);
-        IOLockUnlock(c.lock);
+        ulk();
     }
     if(chain) {
         // A3: transcoder clock and transcoder function configuration (not enabled) before the training.
-        IOLockLock(c.lock);wr(A3::TransClkSel,clk0);wr(TransDDI,trans&~(1U<<31));(void)rd(TransDDI);IOLockUnlock(c.lock);
+        lk();wr(A3::TransClkSel,clk0);wr(TransDDI,trans&~(1U<<31));(void)rd(TransDDI);ulk();
     }
     uint64_t offNs=0;absolutetime_to_nanoseconds(onAt-offAt,&offNs);
     A1LOG("| cycleWait=%ums onWait=%ums ppsOn=%08x panelOff=%llums ",cycleWait,onWait,rd(A2::PPStatus),offNs/1000000ULL);
@@ -8630,40 +8731,40 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=fal
     }
     if(chain) {
         // A3: DSC, transcoder function, pipe, planes.
-        IOLockLock(c.lock);
+        lk();
         wr(A3::DSS1,dss10);wr(A3::DSS2,dss20);
         wr(TransDDI2,ctl20&~(1U<<3));
         wr(TransDDI,trans);
         wr(A3::TransConf,conf0&~(1U<<30));(void)rd(A3::TransConf);
-        IOLockUnlock(c.lock);
+        ulk();
         const uint32_t pipeOnMs=a3WaitBit(A3::TransConf,1U<<30,true,100);
-        IOLockLock(c.lock);
+        lk();
         for(unsigned i=0;i<5;++i)if(planeCtl0[i]&(1U<<31)){wr(A3::PlaneCtl[i],planeCtl0[i]);wr(A3::PlaneSurf[i],planeSurf0[i]);}
         if(cur0&0x27U){wr(A3::CurCntr,cur0);wr(A3::CurBase,curBase0);}
-        IOLockUnlock(c.lock);
-        IOSleep(20);
+        ulk();
+        msl(20);
         A1LOG("| pipeOn=%ums conf=%08x trans=%08x ctl2=%08x dss=%08x/%08x cmtg=%08x plane1=%08x/%08x frame=%u ",pipeOnMs,rd(A3::TransConf),
             rd(TransDDI),rd(TransDDI2),rd(A3::DSS1),rd(A3::DSS2),rd(A3::CmtgCtl),rd(A3::PlaneCtl[0]),rd(A3::PlaneSurf[0]),rd(A3::FrameCount));
     }
     // 7. Backlight on after T8, then the saved TCON and VESA backlight state.
     const uint64_t sinceOn=a2Ms(onAt);
-    if(sinceOn<t8)IOSleep(static_cast<uint32_t>(t8-sinceOn));
-    if(ouiWritten && a2Ms(onAt)<t8+30)IOSleep(30);
-    IOLockLock(c.lock);wr(A2::PPControl,ppc0);(void)rd(A2::PPControl);IOLockUnlock(c.lock);
+    if(sinceOn<t8)msl(static_cast<uint32_t>(t8-sinceOn));
+    if(ouiWritten && a2Ms(onAt)<t8+30)msl(30);
+    lk();wr(A2::PPControl,ppc0);(void)rd(A2::PPControl);ulk();
     bool blOk=true;
     if(intel[4]!=r340[4]){uint8_t v=intel[4];blOk&=a1Aux(true,0x344,&v,1);}
     {uint8_t v=bl[1];blOk&=a1Aux(true,0x721,&v,1);}
     {uint8_t v[2]={bl[2],bl[3]};blOk&=a1Aux(true,0x722,v,2);}
     {uint8_t v=bl[0];blOk&=a1Aux(true,0x720,&v,1);}
-    IOSleep(20);
-    IOLockLock(c.lock);
+    msl(20);
+    lk();
     const uint32_t pipeIir=rd(PipeIIR),sdeIir=rd(SDEIIR),shot=rd(ShotplugDDI);
     wr(ShotplugDDI,(shot&~0x33333333U)|(shot&0x3U));
     wr(SDEIIR,1U<<16);
     if(!(pipeImr&(1U<<31))){wr(PipeIIR,1U<<31);wr(PipeIMR,rd(PipeIMR)&~(1U<<31));}
     if(!(sdeImr&(1U<<16)))wr(SDEIMR,rd(SDEIMR)&~(1U<<16));
     const uint32_t ddi1=rd(DDIBuf),tp1=rd(TPCtl),pps1=rd(A2::PPStatus),ppc1=rd(A2::PPControl),shot1=rd(ShotplugDDI);
-    IOLockUnlock(c.lock);
+    ulk();
     uint8_t st1[8] {},pw1=0,bl1[8] {};
     const bool after=a1Aux(false,0x200,st1,8) && a1Aux(false,0x600,&pw1,1) && a1Aux(false,0x720,bl1,8);
     A1LOG("| total=%llums bl=%d pipeIir=%08x sdeIir=%08x shotplug=%08x>%08x ddi=%08x tp=%08x pps=%08x ppc=%08x ",
@@ -8674,6 +8775,13 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=fal
     const bool good=ok && after && a1EQ(st1+2) && pipeGood;
     A1LOG("result=%s",good ? "ok" : "FAILED");
     return good ? 0 : EIO;
+}
+static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=false) {
+    const int r=g2Off(chain,cmtgOff,pll);
+    if(r)return r;
+    A1LOG("| off=%ums ",offMs);
+    msl(offMs);
+    return g2On();
 }
 static int a2Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     int value=static_cast<int>(A2::runs);
@@ -8718,6 +8826,74 @@ static int a4Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) 
     return result;
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a4, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a4Handler, "I", "N=600-5000: eDP chain, CMTG A, DDI A clock and DPLL0 off for N ms and back (G phase 2 step A4)");
+// ---- G phase 2, step A5a: the A4 chain inside the sleep (runtime switch, off by default) ----
+// debug.wexpsr.a5=1 lets XE-PM's S0ixSleep hook run g2Off (A4: panel, link, pipe, transcoder, DSC, CMTG A,
+// DDI A clock, DPLL0) on entering S0ixSleep's wait and g2On on leaving it, in raw mode. No DMC, no DC
+// states, no power well change. debug.wexpsr.a5test=N runs the same raw sequence from thread context
+// (screen off first). Results: debug.wexpsr.a5stat, debug.wexpsr.a5log (log of the last sleep).
+namespace G5 {
+static int enabled=0;
+static uint32_t stat[10]; // enters, offOk, offRefused, exits, onOk, onFailed, lastOff, lastOn, lastReason, skipsBusy
+static char lastLog[6144];
+}
+static void g5Hook(uint32_t phase,uint32_t reason) {
+    using namespace G5;
+    if(!__atomic_load_n(&enabled,__ATOMIC_ACQUIRE) || !map)return;
+    if(phase==0) {
+        ++stat[0];
+        if(!OSCompareAndSwap(0,1,&A1::busy)){++stat[9];return;}
+        gRaw=true;const int r=g2Off(true,true,true);gRaw=false;
+        stat[6]=static_cast<uint32_t>(r);
+        if(r){++stat[2];A1LOG(" | enter-refused");memcpy(lastLog,A1::text,sizeof(lastLog));OSCompareAndSwap(1,0,&A1::busy);}
+        else ++stat[1];
+    } else if(phase==1) {
+        if(!g2s.active)return;
+        ++stat[3];stat[8]=reason;
+        gRaw=true;const int r=g2On();gRaw=false;
+        stat[7]=static_cast<uint32_t>(r);
+        if(r)++stat[5];else ++stat[4];
+        A1LOG(" | wake reason=%u aux=%u/%u/%u",reason,auxXfers,auxRetries,auxFails);
+        memcpy(lastLog,A1::text,sizeof(lastLog));
+        OSCompareAndSwap(1,0,&A1::busy);
+    }
+}
+static int a5Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=__atomic_load_n(&G5::enabled,__ATOMIC_ACQUIRE);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=0 && value!=1)return EINVAL;
+    __atomic_store_n(&G5::enabled,value,__ATOMIC_RELEASE);
+    return 0;
+}
+static int a5TestHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=0;
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<600 || value>5000)return EINVAL;
+    if(!OSCompareAndSwap(0,1,&A1::busy))return EBUSY;
+    gRaw=true;
+    int result=g2Off(true,true,true);
+    if(!result){A1LOG("| raw off=%dms ",value);msl(static_cast<uint32_t>(value));result=g2On();}
+    gRaw=false;
+    A1LOG(" | raw aux=%u/%u/%u",G5::auxXfers,G5::auxRetries,G5::auxFails);
+    IOLog("WEXG2A5T %s\n",A1::text);
+    OSCompareAndSwap(1,0,&A1::busy);
+    return result;
+}
+static char g5StatText[256];
+static int a5StatHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    using namespace G5;
+    snprintf(g5StatText,sizeof(g5StatText),"enabled=%d enters=%u offOk=%u offRefused=%u exits=%u onOk=%u onFailed=%u lastOff=%u lastOn=%u reason=%u busy=%u active=%d aux=%u/%u/%u",
+        enabled,stat[0],stat[1],stat[2],stat[3],stat[4],stat[5],stat[6],stat[7],stat[8],stat[9],g2s.active,auxXfers,auxRetries,auxFails);
+    return sysctl_handle_string(oidp,g5StatText,sizeof(g5StatText),req);
+}
+static int a5LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    return sysctl_handle_string(oidp,G5::lastLog,sizeof(G5::lastLog),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Handler, "I", "1: A4 chain off/on inside S0ixSleep's wait (G phase 2 step A5a)");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5test, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TestHandler, "I", "N=600-5000: the A5 raw sequence from thread context");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5stat, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a5StatHandler, "A", "A5 counters");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5log, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a5LogHandler, "A", "A5 log of the last sleep");
 // Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
 // write debug.wexpsr.addr, then read or write debug.wexpsr.val.
 static int peekAddr=0x70180;
@@ -8770,11 +8946,17 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a2);
     sysctl_register_oid(&sysctl__debug_wexpsr_a3);
     sysctl_register_oid(&sysctl__debug_wexpsr_a4);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5stat);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5log);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
     sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();
 }
 }
+// Called by XE-PM's S0ixSleep hook (kern_xepm.cpp), interrupts off, one CPU.
+void wexG5Hook(uint32_t phase,uint32_t reason){WEXPSR::g5Hook(phase,reason);}
 void XE::edpPSRDisableTimed() {
     if(WEXPSR::lock)IOLockLock(WEXPSR::lock),++WEXPSR::record.autoOffs,IOLockUnlock(WEXPSR::lock);
     edpPSRRequest(0);

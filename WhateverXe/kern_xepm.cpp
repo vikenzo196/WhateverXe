@@ -312,9 +312,12 @@ static void xpGtReset() {
 // S0ixSleep wait hook (its interrupts-off, single-CPU context): the GT reset on the way out.
 static uint32_t gXpS0ixHookCalls[2] = {0, 0};
 static int gXpS0ixHooked = 0;   // 1 added, -1 refused (no free slot)
-static void xpS0ixHook(void *, uint32_t phase, uint32_t) {
+// G phase 2 (kern_xe.cpp): the eDP chain off on the way in and back on the way out, when debug.wexpsr.a5=1.
+void wexG5Hook(uint32_t phase, uint32_t reason);
+static void xpS0ixHook(void *, uint32_t phase, uint32_t reason) {
 	if (phase < 2) gXpS0ixHookCalls[phase]++;
-	if (phase == 1) xpGtReset();
+	if (phase == 0) wexG5Hook(0, reason);
+	if (phase == 1) { xpGtReset(); wexG5Hook(1, reason); }
 }
 static void xpS0ixRegisterHooks(const XpS0ixShared *sh) {
 	if (gXpS0ixHooked || !sh->addHook) return;
