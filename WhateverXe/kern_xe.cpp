@@ -8279,7 +8279,7 @@ constexpr uint32_t DDIBuf=0x64000,TPCtl=0x60540,TPStatus=0x60544,TransDDI=0x6040
     PipeIMR=0x44404,PipeIIR=0x44408,SDEIMR=0xC4004,SDEIIR=0xC4008,SDEIER=0xC400C,ShotplugDDI=0xC4030;
 constexpr uint32_t BufEnable=1U<<31,BufIdle=1U<<7,TPEnable=1U<<31,TPTrain=7U<<8,TPIdleDone=1U<<25;
 constexpr uint32_t Pat1=0U<<8,Idle=2U<<8,Normal=3U<<8,Pat3=4U<<8;
-static char text[4096];
+static char text[6144];
 static size_t used=0;
 static volatile UInt32 busy=0;
 static uint32_t runs=0,lastResult=0;
@@ -8440,7 +8440,27 @@ static bool a2AuxRetry(bool write,uint32_t address,uint8_t *data,uint32_t length
     for(unsigned i=0;i<3;++i){if(a1Aux(write,address,data,length))return true;IOSleep(1);}
     return false;
 }
-static int a2Run(uint32_t offMs) {
+// A3 (chain=true) adds, like Linux intel_disable_ddi / intel_ddi_post_disable and hsw_crtc_enable /
+// intel_ddi_enable: primary planes and cursor of pipe A off (PLANE_CTL 0, PLANE_SURF 0) before
+// TRANSCONF A off (wait for the pipe state), TRANS_DDI_FUNC_CTL2 A 0 (the transcoder leaves CMTG
+// secondary mode, as Linux does on display 13), TRANS_DDI_FUNC_CTL A off with port and mode cleared,
+// DSS_CTL1/2 A 0, TRANS_CLK_SEL A off after the DDI buffer; on the way up TRANS_CLK_SEL and the
+// TRANS_DDI_FUNC_CTL configuration before the training, then DSS_CTL1/2, TRANS_DDI_FUNC_CTL2 without
+// the secondary bit, TRANS_DDI_FUNC_CTL, TRANSCONF A (wait for the pipe state) and the saved planes.
+// With cmtgOff the CMTG A is disabled too (intel_cmtg_disable: CMTG_SCANLINE_GB1 enable off,
+// TRANS_CMTG_CTL enable off, wait for the CMTG state); it is not re-enabled.
+namespace A3 {
+constexpr uint32_t TransConf=0x70008,TransClkSel=0x46140,DSS1=0x78000,DSS2=0x78004,CmtgCtl=0x6FA88,CmtgGB1=0x456A0,
+    FrameCount=0x70040,CurCntr=0x70080,CurBase=0x70084;
+constexpr uint32_t PlaneCtl[5]={0x70180,0x70280,0x70380,0x70480,0x70580},PlaneSurf[5]={0x7019C,0x7029C,0x7039C,0x7049C,0x7059C};
+static uint32_t runs=0;
+}
+static uint32_t a3WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxMs) {
+    uint32_t ms=0;
+    while(((rd(reg)&mask)!=0)!=set && ms<maxMs){IOSleep(1);++ms;}
+    return ms;
+}
+static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false) {
     using namespace A1;
     auto &c=display13FBPower;
     if(!map || !c.lock || map->getLength()<ShotplugDDI+4)return ENODEV;
@@ -8461,7 +8481,14 @@ static int a2Run(uint32_t offMs) {
         (trans&(1U<<31)) && ((trans>>27)&0xF)==1 && ((trans>>24)&7)==2 &&
         (pps0&(A2::PPOn|A2::PPSeq|A2::PPState))==(A2::PPOn|A2::PPStateOnIdle) && (ppc0&(A2::PowerOn|A2::ForceVdd))==A2::PowerOn;
     const bool sinkOk=(cfg[1]&0x1F)==4 && cfg[4]==level && cfg[5]==level && cfg[6]==level && !(level&0xE4) && a1EQ(st+2) && pw==1;
-    if(!regsOk || !sinkOk){A1LOG("result=precondition regs=%d sink=%d",regsOk,sinkOk);return EBUSY;}
+    const uint32_t conf0=rd(A3::TransConf),clk0=rd(A3::TransClkSel),ctl20=rd(TransDDI2),dss10=rd(A3::DSS1),dss20=rd(A3::DSS2),
+        cmtg0=rd(A3::CmtgCtl),gb10=rd(A3::CmtgGB1),cur0=rd(A3::CurCntr),curBase0=rd(A3::CurBase),frame0=rd(A3::FrameCount);
+    uint32_t planeCtl0[5] {},planeSurf0[5] {};
+    for(unsigned i=0;i<5;++i){planeCtl0[i]=rd(A3::PlaneCtl[i]);planeSurf0[i]=rd(A3::PlaneSurf[i]);}
+    const bool chainOk=!chain || ((conf0&0xC0000000U)==0xC0000000U && (clk0>>28)==1);
+    if(chain)A1LOG("A3 run=%u cmtgOff=%d conf=%08x clk=%08x ctl2=%08x dss=%08x/%08x cmtg=%08x gb1=%08x cur=%08x/%08x frame=%u plane1=%08x/%08x ",
+        A3::runs,cmtgOff,conf0,clk0,ctl20,dss10,dss20,cmtg0,gb10,cur0,curBase0,frame0,planeCtl0[0],planeSurf0[0]);
+    if(!regsOk || !sinkOk || !chainOk){A1LOG("result=precondition regs=%d sink=%d chain=%d",regsOk,sinkOk,chainOk);return EBUSY;}
     const uint32_t interval=caps[0x0E]&0x7F;
     const uint32_t eqDelayMs=interval ? (interval>4 ? 16 : 4*interval) : 1;
     const uint32_t t9=(offDelays&0x1FFF)/10,t8=(onDelays&0x1FFF)/10;
@@ -8474,12 +8501,35 @@ static int a2Run(uint32_t offMs) {
     if(bl[0]&1){uint8_t v=bl[0]&~1;a1Aux(true,0x720,&v,1);}
     IOLockLock(c.lock);wr(A2::PPControl,rd(A2::PPControl)&~A2::BLC);(void)rd(A2::PPControl);IOLockUnlock(c.lock);
     IOSleep(t9);
+    if(chain) {
+        // A3: planes and cursor off, pipe off, transcoder function off, DSC off.
+        IOLockLock(c.lock);
+        for(unsigned i=0;i<5;++i)if(planeCtl0[i]&(1U<<31)){wr(A3::PlaneCtl[i],0);wr(A3::PlaneSurf[i],0);}
+        if(cur0&0x27U){wr(A3::CurCntr,0);wr(A3::CurBase,0);}
+        IOLockUnlock(c.lock);
+        IOSleep(20);
+        IOLockLock(c.lock);wr(A3::TransConf,conf0&~(1U<<31));(void)rd(A3::TransConf);IOLockUnlock(c.lock);
+        const uint32_t pipeOffMs=a3WaitBit(A3::TransConf,1U<<30,false,100);
+        IOLockLock(c.lock);
+        wr(TransDDI2,0);
+        wr(TransDDI,trans&~((1U<<31)|(0xFU<<27)|(7U<<24)));(void)rd(TransDDI);
+        IOLockUnlock(c.lock);
+        uint32_t cmtgMs=0;
+        if(cmtgOff) {
+            IOLockLock(c.lock);wr(A3::CmtgGB1,rd(A3::CmtgGB1)&~(1U<<31));wr(A3::CmtgCtl,rd(A3::CmtgCtl)&~(1U<<31));IOLockUnlock(c.lock);
+            cmtgMs=a3WaitBit(A3::CmtgCtl,1U<<23,false,50);
+        }
+        IOLockLock(c.lock);wr(A3::DSS1,0);wr(A3::DSS2,0);(void)rd(A3::DSS2);IOLockUnlock(c.lock);
+        A1LOG("| pipeOff=%ums conf=%08x trans=%08x ctl2=%08x cmtg=%08x cmtgMs=%u dss=%08x/%08x frame=%u ",pipeOffMs,rd(A3::TransConf),
+            rd(TransDDI),rd(TransDDI2),rd(A3::CmtgCtl),cmtgMs,rd(A3::DSS1),rd(A3::DSS2),rd(A3::FrameCount));
+    }
     // 2. Sink D3, link off.
     uint8_t d3=2;const bool d3Ok=a1Aux(true,0x600,&d3,1);
     IOLockLock(c.lock);
     wr(DDIBuf,ddi0&~BufEnable);
     wr(TPCtl,tp0&~(TPEnable|TPTrain));(void)rd(TPCtl);
     const uint32_t idleUs=a1Wait(DDIBuf,BufIdle,true,10000);
+    if(chain)wr(A3::TransClkSel,0);
     // 3. Panel power off.
     wr(A2::PPControl,rd(A2::PPControl)&~(A2::PowerOn|A2::PowerReset|A2::ForceVdd|A2::BLC));(void)rd(A2::PPControl);
     IOLockUnlock(c.lock);
@@ -8498,6 +8548,10 @@ static int a2Run(uint32_t offMs) {
     const uint32_t onWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPState,A2::PPOn|A2::PPStateOnIdle,5000);
     const uint64_t onAt=mach_absolute_time();
     IOLockLock(c.lock);wr(A2::ClockGate,rd(A2::ClockGate)&~A2::DPLSGate);IOLockUnlock(c.lock);
+    if(chain) {
+        // A3: transcoder clock and transcoder function configuration (not enabled) before the training.
+        IOLockLock(c.lock);wr(A3::TransClkSel,clk0);wr(TransDDI,trans&~(1U<<31));(void)rd(TransDDI);IOLockUnlock(c.lock);
+    }
     uint64_t offNs=0;absolutetime_to_nanoseconds(onAt-offAt,&offNs);
     A1LOG("| cycleWait=%ums onWait=%ums ppsOn=%08x panelOff=%llums ",cycleWait,onWait,rd(A2::PPStatus),offNs/1000000ULL);
     // 6. Sink back: reset values, source OUI, D0, link configuration, DSC.
@@ -8521,6 +8575,23 @@ static int a2Run(uint32_t offMs) {
         cfgOk=cfgOk && a1Aux(true,0x115,&rate,1) && a1Aux(true,0x160,&enable,1);
         A1LOG("| cfg%u=%d bw=%02x ",attempt,cfgOk,attempt==1 ? 0 : link[0]);
         ok=cfgOk && a1Attempt(attempt,ddi0,tp0,level,eqDelayMs);
+    }
+    if(chain) {
+        // A3: DSC, transcoder function, pipe, planes.
+        IOLockLock(c.lock);
+        wr(A3::DSS1,dss10);wr(A3::DSS2,dss20);
+        wr(TransDDI2,ctl20&~(1U<<3));
+        wr(TransDDI,trans);
+        wr(A3::TransConf,conf0&~(1U<<30));(void)rd(A3::TransConf);
+        IOLockUnlock(c.lock);
+        const uint32_t pipeOnMs=a3WaitBit(A3::TransConf,1U<<30,true,100);
+        IOLockLock(c.lock);
+        for(unsigned i=0;i<5;++i)if(planeCtl0[i]&(1U<<31)){wr(A3::PlaneCtl[i],planeCtl0[i]);wr(A3::PlaneSurf[i],planeSurf0[i]);}
+        if(cur0&0x27U){wr(A3::CurCntr,cur0);wr(A3::CurBase,curBase0);}
+        IOLockUnlock(c.lock);
+        IOSleep(20);
+        A1LOG("| pipeOn=%ums conf=%08x trans=%08x ctl2=%08x dss=%08x/%08x cmtg=%08x plane1=%08x/%08x frame=%u ",pipeOnMs,rd(A3::TransConf),
+            rd(TransDDI),rd(TransDDI2),rd(A3::DSS1),rd(A3::DSS2),rd(A3::CmtgCtl),rd(A3::PlaneCtl[0]),rd(A3::PlaneSurf[0]),rd(A3::FrameCount));
     }
     // 7. Backlight on after T8, then the saved TCON and VESA backlight state.
     const uint64_t sinceOn=a2Ms(onAt);
@@ -8546,7 +8617,8 @@ static int a2Run(uint32_t offMs) {
     A1LOG("| total=%llums bl=%d pipeIir=%08x sdeIir=%08x shotplug=%08x>%08x ddi=%08x tp=%08x pps=%08x ppc=%08x ",
         a2Ms(t0),blOk,pipeIir,sdeIir,shot,shot1,ddi1,tp1,pps1,ppc1);
     if(after){a1Hex("st200after",st1,8);A1LOG("pw600after=%02x ",pw1);a1Hex("bl720after",bl1,8);}
-    const bool good=ok && after && a1EQ(st1+2);
+    const bool pipeGood=!chain || (rd(A3::TransConf)&(1U<<30));
+    const bool good=ok && after && a1EQ(st1+2) && pipeGood;
     A1LOG("result=%s",good ? "ok" : "FAILED");
     return good ? 0 : EIO;
 }
@@ -8564,6 +8636,21 @@ static int a2Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) 
     return result;
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a2, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a2Handler, "I", "N=600-5000: eDP panel off for N ms and back (G phase 2 step A2)");
+static int a3Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=static_cast<int>(A3::runs);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    const bool cmtgOff=value>=10000;const int ms=cmtgOff ? value-10000 : value;
+    if(ms<600 || ms>5000)return EINVAL;
+    if(!OSCompareAndSwap(0,1,&A1::busy))return EBUSY;
+    ++A3::runs;
+    const int result=a2Run(static_cast<uint32_t>(ms),true,cmtgOff);
+    IOLog("WEXG2A3 %s\n",A1::text);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXG2A3",A1::text);
+    OSCompareAndSwap(1,0,&A1::busy);
+    return result;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a3, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a3Handler, "I", "N=600-5000 (+10000: CMTG off too): eDP chain off for N ms and back (G phase 2 step A3)");
 // Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
 // write debug.wexpsr.addr, then read or write debug.wexpsr.val.
 static int peekAddr=0x70180;
@@ -8614,6 +8701,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a1);
     sysctl_register_oid(&sysctl__debug_wexpsr_a1log);
     sysctl_register_oid(&sysctl__debug_wexpsr_a2);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a3);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
     sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();
