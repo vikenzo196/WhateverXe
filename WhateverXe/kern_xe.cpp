@@ -8845,6 +8845,15 @@ static bool dc6Active=false;
 constexpr uint32_t PwCtl=0x45404,AuxCtl2=0x45444,DdiCtl2=0x45454;
 constexpr uint32_t PwReqs[4]={1U<<15,1U<<13,1U<<11,1U<<3}; // PW_C, PW_B, PW_A, PW2 (state = request>>1)
 static uint32_t dc6Dropped=0,dc6Aux=0,dc6Ddi=0;
+// Mode: 1 = DC6, 2 = control run (wells released and requested again, DC states never allowed).
+static int dc6Mode=0;
+static uint32_t dc6Lost=0;
+// PW_A canaries (pipe A registers the DMC does not restore if PW_A loses power): PIPE_MISC, PLANE_STRIDE,
+// PLANE_SIZE, PLANE_BUF_CFG, PS_CTRL, GAMMA_MODE, DSC0/DSC1 PPS0. If any differs after the wells are back the
+// chain is not restarted (bc 0x2D) and the caller reboots.
+constexpr uint32_t Canary[8]={0x70030,0x70188,0x70190,0x7027C,0x68180,0x4A480,0x78070,0x78170};
+static uint32_t canary0[8];
+constexpr uint32_t FuseStatus=0x42000;
 }
 // ---- Black box and watchdog for the DC6 measurement ----
 // Black box: when debug.wexpsr.bcofs names a CMOS byte (0x0E-0xFE, chosen from debug.wexpsr.cmos as one the
@@ -8952,7 +8961,9 @@ static void g5Dc6Enter() {
     const bool pipesOff=!(rd(0x71008)&(1U<<31)) && !(rd(0x72008)&(1U<<31)) && !(rd(0x73008)&(1U<<31));
     A1LOG("| DC6 arm dmc=%d pipesOff=%d pw=%08x aux=%08x ddi=%08x dcEn=%08x dcDbg=%08x dc5=%u dc6=%u ",dmcLoaded,pipesOff,rd(PwCtl),
         rd(AuxCtl2),rd(DdiCtl2),rd(DCStateEn),rd(DCStateDebug),rd(DC5Count),rd(DC6Count));
-    if(!dmcLoaded || !pipesOff){bc(0x1F);return;}
+    if((dc6Arm==1 && !dmcLoaded) || !pipesOff){bc(0x1F);return;}
+    dc6Mode=dc6Arm;
+    for(unsigned i=0;i<8;++i)canary0[i]=rd(Canary[i]);
     const uint32_t sec=static_cast<uint32_t>(__atomic_load_n(&tcoSec,__ATOMIC_ACQUIRE));
     const bool armed=sec && tcoArm(sec);
     A1LOG("tco=%u/%d ",sec,armed);
@@ -8964,9 +8975,9 @@ static void g5Dc6Enter() {
     dc6Ddi=rd(DdiCtl2)&2U;if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)&~2U);(void)g5WaitBit(DdiCtl2,1U,false,1000);}
     A1LOG("released=%08x pw=%08x aux=%08x ddi=%08x ",dc6Dropped,rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2));
     bc(0x13);
-    writeDCState(2);
+    if(dc6Mode==1){writeDCState(2);bc(0x14);}
+    else bc(0x15);
     dc6Active=true;
-    bc(0x14);
 }
 static void g5Dc6Exit() {
     using namespace G5;
@@ -8977,15 +8988,35 @@ static void g5Dc6Exit() {
     const uint32_t en=rd(DCStateEn);
     writeDCState(0);
     bc(0x22);
-    uint32_t pwUs=0;
+    // Like Linux gen9_disable_dc_states + hsw_power_well_enable: let the DMC finish restoring PW1 (state bit,
+    // PG0/PG1 fuse distribution) before PW2, then for each well its state and, for PW2/PW_A/PW_B/PW_C, its fuse.
+    uint32_t pwUs=g5WaitBit(PwCtl,1U,true,10000);
+    pwUs+=g5WaitBit(FuseStatus,1U<<27,true,10000);
+    pwUs+=g5WaitBit(FuseStatus,1U<<26,true,10000);
+    IODelay(100);
+    bc(0x30);
     const uint32_t order[4]={1U<<3,1U<<11,1U<<13,1U<<15}; // PW2, PW_A, PW_B, PW_C
-    for(auto req:order)if(dc6Dropped&req){wr(PwCtl,rd(PwCtl)|req);pwUs+=g5WaitBit(PwCtl,req>>1,true,10000);}
-    if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)|2U);pwUs+=g5WaitBit(AuxCtl2,1U,true,10000);}
-    if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)|2U);pwUs+=g5WaitBit(DdiCtl2,1U,true,10000);}
+    const uint32_t fuse[4]={1U<<25,1U<<21,1U<<20,1U<<19};  // PG2, PG6, PG7, PG8
+    uint32_t waits[6] {};
+    for(unsigned i=0;i<4;++i) {
+        if(!(dc6Dropped&order[i]))continue;
+        wr(PwCtl,rd(PwCtl)|order[i]);
+        waits[i]=g5WaitBit(PwCtl,order[i]>>1,true,10000);
+        waits[i]+=g5WaitBit(FuseStatus,fuse[i],true,10000);
+        bc(static_cast<uint8_t>(0x31+i));
+    }
+    if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)|2U);waits[4]=g5WaitBit(AuxCtl2,1U,true,10000);}
+    bc(0x35);
+    if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)|2U);waits[5]=g5WaitBit(DdiCtl2,1U,true,10000);}
+    bc(0x36);
+    for(auto w:waits)pwUs+=w;
     bc(0x23);
     const uint32_t dc5=rd(DC5Count),dc6=rd(DC6Count);
-    A1LOG("| DC6 exit dcEnWas=%08x dc5=%u dc6=%u dcEn=%08x pw=%08x aux=%08x ddi=%08x wellsUs=%u dss=%08x/%08x pps78070=%08x plane1buf=%08x ",
-        en,dc5,dc6,rd(DCStateEn),rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),pwUs,rd(0x78000),rd(0x78004),rd(0x78070),rd(0x7027C));
+    A1LOG("| DC6 exit mode=%d dcEnWas=%08x dc5=%u dc6=%u dcEn=%08x pw=%08x aux=%08x ddi=%08x fuse=%08x wellsUs=%u waits=%u/%u/%u/%u/%u/%u ",
+        dc6Mode,en,dc5,dc6,rd(DCStateEn),rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),rd(FuseStatus),pwUs,waits[0],waits[1],waits[2],waits[3],waits[4],waits[5]);
+    dc6Lost=0;
+    for(unsigned i=0;i<8;++i){const uint32_t v=rd(Canary[i]);if(v!=canary0[i])dc6Lost|=1U<<i;A1LOG("%x=%08x>%08x ",Canary[i],canary0[i],v);}
+    bc(dc6Lost ? 0x2D : 0x2C);
 }
 static void g5Hook(uint32_t phase,uint32_t reason) {
     using namespace G5;
@@ -9004,8 +9035,12 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
         if(!g2s.active)return;
         ++stat[3];stat[8]=reason;
         bc(0x20);
-        gRaw=true;g5Dc6Exit();bc(0x24);const int r=g2On();gRaw=false;
-        bc(r ? 0x2E : 0x2F);
+        dc6Lost=0;
+        gRaw=true;g5Dc6Exit();
+        int r=EIO;
+        if(!dc6Lost){bc(0x24);r=g2On();bc(r ? 0x2E : 0x2F);}
+        else {g2s.active=false;A1LOG(" | chain NOT restarted: pipe A registers lost (mask %x)",dc6Lost);}
+        gRaw=false;
         tcoHalt();
         stat[7]=static_cast<uint32_t>(r);
         if(r)++stat[5];else ++stat[4];
@@ -9052,8 +9087,8 @@ static int a5Dc6Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *re
     int value=__atomic_load_n(&G5::dc6Arm,__ATOMIC_ACQUIRE);
     const int error=sysctl_handle_int(oidp,&value,0,req);
     if(error || !req->newptr)return error;
-    if(value!=0 && value!=1)return EINVAL;
-    if(value && !dmcLoaded)return ENXIO;
+    if(value<0 || value>2)return EINVAL;
+    if(value==1 && !dmcLoaded)return ENXIO;
     __atomic_store_n(&G5::dc6Arm,value,__ATOMIC_RELEASE);
     return 0;
 }
