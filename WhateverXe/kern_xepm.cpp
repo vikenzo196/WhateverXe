@@ -249,12 +249,6 @@ static int gXpWaitPkg = -1;
 static mach_vm_address_t gXpRdmsrCarefully = 0;
 // For kern_xe.cpp diagnostics (debug.wexpsr.msrval): -1 if rdmsr_carefully was not found.
 int xePmRdmsrCarefully(uint32_t msr, uint32_t *lo, uint32_t *hi) {
-	// Solved at start only on the s2idle route; with S0ixSleep owning the sleep, solve it on first use.
-	if (!gXpRdmsrCarefully) {
-		KernelPatcher &patcher = lilu.getKernelPatcher();
-		gXpRdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
-		patcher.clearError();
-	}
 	if (!gXpRdmsrCarefully) return -1;
 	return reinterpret_cast<int (*)(uint32_t, uint32_t *, uint32_t *)>(gXpRdmsrCarefully)(msr, lo, hi);
 }
