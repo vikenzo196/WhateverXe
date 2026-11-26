@@ -9045,6 +9045,46 @@ static void tcoHalt() {
     outw(static_cast<uint16_t>(b+8),static_cast<uint16_t>(cnt|0x0001U));      // NO_REBOOT back on
     outw(static_cast<uint16_t>(b+4),0x0008);outw(static_cast<uint16_t>(b+6),0x0002);
 }
+// TCSS D3cold (debug.wexpsr.a5tcss=1): what the firmware's \_SB.PC00.D3C._OFF (TCOF) and _ON (TCON) do, done from the
+// sleep hook: IOM register REGBAR+0xC10000+0x40, bit 15 TD3C set on the way in; on the way out cleared and TACK (bit
+// 16) awaited (up to 100 ms, TCON). TBT0/TBT1._OFF are no-ops here (no TBT host driver, IMR not valid). The IOM page is
+// mapped when the switch is set (REGBAR from MCHBAR 0xFEDC7110).
+static int tcssArm=0;
+static IOMemoryMap *iomMap=nullptr;
+static volatile uint32_t *iomCtl=nullptr;
+static uint32_t tcssBefore=0,tcssAfterSet=0,tcssAfterClear=0,tcssAckUs=0;
+static bool tcssActive=false;
+static bool tcssMap() {
+    if(iomCtl)return true;
+    IOMemoryDescriptor *md=IOMemoryDescriptor::withPhysicalAddress(0xFEDC7000ULL,4096,kIODirectionInOut);
+    if(!md)return false;
+    IOMemoryMap *m=md->map(kIOMapInhibitCache);md->release();
+    if(!m)return false;
+    const uint64_t regbar=*reinterpret_cast<volatile uint64_t *>(m->getVirtualAddress()+0x110);
+    m->release();
+    if(!(regbar&1) || (regbar&~1ULL)<0xC0000000ULL || (regbar&~1ULL)>0xFF000000ULL)return false;
+    md=IOMemoryDescriptor::withPhysicalAddress((regbar&~1ULL)+0xC10000,4096,kIODirectionInOut);
+    if(!md)return false;
+    iomMap=md->map(kIOMapInhibitCache);md->release();
+    if(!iomMap)return false;
+    iomCtl=reinterpret_cast<volatile uint32_t *>(iomMap->getVirtualAddress()+0x40);
+    return true;
+}
+static void tcssEnter() {
+    if(!iomCtl)return;
+    tcssBefore=*iomCtl;
+    *iomCtl=tcssBefore|(1U<<15);
+    IODelay(100);
+    tcssAfterSet=*iomCtl;tcssActive=true;
+}
+static void tcssExit() {
+    if(!tcssActive || !iomCtl)return;
+    tcssActive=false;
+    *iomCtl=*iomCtl&~(1U<<15);
+    uint32_t us=0;
+    while((*iomCtl&(1U<<16)) && us<100000){IODelay(100);us+=100;}
+    tcssAckUs=us;tcssAfterClear=*iomCtl;
+}
 static uint32_t g5WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxUs) {
     uint32_t us=0;
     while(((rd(reg)&mask)!=0)!=set && us<maxUs){IODelay(10);us+=10;}
@@ -9149,6 +9189,7 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
         ++bcRun;bc(0x10);
         gRaw=true;const int r=g2Off(true,true,true);
         if(!r && __atomic_load_n(&dc6Arm,__ATOMIC_ACQUIRE))g5Dc6Enter();
+        if(!r && __atomic_load_n(&tcssArm,__ATOMIC_ACQUIRE)){bc(0x40);tcssEnter();bc(0x41);A1LOG("| tcss before=%08x set=%08x ",tcssBefore,tcssAfterSet);}
         gRaw=false;
         stat[6]=static_cast<uint32_t>(r);
         if(r){++stat[2];A1LOG(" | enter-refused");memcpy(lastLog,A1::text,sizeof(lastLog));OSCompareAndSwap(1,0,&A1::busy);}
@@ -9157,6 +9198,7 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
         if(!g2s.active)return;
         ++stat[3];stat[8]=reason;
         bc(0x20);
+        if(tcssActive){bc(0x42);tcssExit();bc(0x43);A1LOG("| tcss clear=%08x ackUs=%u ",tcssAfterClear,tcssAckUs);}
         dc6Lost=0;
         gRaw=true;g5Dc6Exit();
         int r=EIO;
@@ -9287,6 +9329,16 @@ SYSCTL_PROC(_debug_wexpsr, OID_AUTO, cmos, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, bcofs, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, bcOfsHandler, "I", "CMOS byte for the DC6 black box (-1 off)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, tco, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, tcoHandler, "A", "PCH TCO watchdog registers (read only)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, tcosec, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, tcoSecHandler, "I", "TCO watchdog seconds armed during the DC6 measurement (0 off)");
+static int a5TcssHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=__atomic_load_n(&tcssArm,__ATOMIC_ACQUIRE);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=0 && value!=1)return EINVAL;
+    if(value && !tcssMap())return ENXIO;
+    __atomic_store_n(&tcssArm,value,__ATOMIC_RELEASE);
+    return 0;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5tcss, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TcssHandler, "I", "1: TCSS D3cold (IOM TD3C) inside the A5 sleep");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5dc6, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Dc6Handler, "I", "1: next A5 sleep also releases PW_C/B/A/PW2, AUX A, DDI A IO and allows DC6 (one sleep)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5test, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TestHandler, "I", "N=600-5000: the A5 raw sequence from thread context");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5stat, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a5StatHandler, "A", "A5 counters");
@@ -9346,6 +9398,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
     sysctl_register_oid(&sysctl__debug_wexpsr_physaddr);
