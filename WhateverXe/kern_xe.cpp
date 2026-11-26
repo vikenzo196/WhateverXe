@@ -1,5 +1,6 @@
 #include "kern_display13_color.hpp"
 #include <architecture/i386/pio.h>
+int xePmRdmsrCarefully(uint32_t msr,uint32_t *lo,uint32_t *hi); // kern_xepm.cpp (kernel rdmsr_carefully, solved by Lilu)
 #include <mach/clock.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
@@ -9322,7 +9323,6 @@ static int physValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *
 // MSR read (debug.wexpsr.msraddr, then debug.wexpsr.msrval on the current CPU through rdmsr_carefully, so a missing
 // MSR gives an error instead of #GP) for the package C-state limits (0xE2) and interrupt response time limits
 // (0x60A-0x60C, 0x633-0x635).
-int xePmRdmsrCarefully(uint32_t msr,uint32_t *lo,uint32_t *hi); // kern_xepm.cpp (kernel rdmsr_carefully, solved by Lilu)
 static uint32_t msrAddr=0xE2;
 static char msrText[64];
 static int msrAddrHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
@@ -9333,7 +9333,7 @@ static int msrAddrHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *
 static int msrValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     uint32_t lo=0,hi=0;
     const boolean_t ints=ml_set_interrupts_enabled(false);
-    const int bad=xePmRdmsrCarefully(msrAddr,&lo,&hi);
+    const int bad=::xePmRdmsrCarefully(msrAddr,&lo,&hi);
     ml_set_interrupts_enabled(ints);
     if(bad)snprintf(msrText,sizeof(msrText),"msr %x: not readable",msrAddr);
     else snprintf(msrText,sizeof(msrText),"msr %x = %08x%08x",msrAddr,hi,lo);
