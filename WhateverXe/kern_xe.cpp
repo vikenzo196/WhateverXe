@@ -8231,6 +8231,24 @@ static int pmcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req)
     return sysctl_handle_string(oidp,pmcText,sizeof(pmcText),req);
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pmc, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC LTR / power gating snapshot");
+// Read-only snapshot of the panel power sequencer, the combo PHY of port A and the DPLL configuration
+// (offsets beyond the 0x40000-0x7FFFF peek window), for planning a panel power down in sleep. Reads only;
+// every offset is checked against the length of the GPU MMIO mapping.
+static constexpr uint32_t g1bRanges[][2]={{0xC7200,0xC7214},{0xC7300,0xC7314},{0x64C00,0x64C04},
+    {0x162000,0x16203C},{0x162100,0x16212C},{0x162800,0x1628BC},{0x162900,0x1629BC},{0x162A00,0x162ABC},
+    {0x162B00,0x162BBC},{0x164280,0x1642A4}};
+static char g1bText[6144];
+static int g1bHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    if(!map)return ENODEV;
+    const uint64_t length=map->getLength();
+    size_t used=0;g1bText[0]=0;
+    for(const auto &r:g1bRanges)
+        for(uint32_t o=r[0];o<=r[1] && used+20<sizeof(g1bText);o+=4)
+            used+=o+4<=length ? snprintf(g1bText+used,sizeof(g1bText)-used,"%x=%08x,",o,rd(o))
+                              : snprintf(g1bText+used,sizeof(g1bText)-used,"%x=out,",o);
+    return sysctl_handle_string(oidp,g1bText,sizeof(g1bText),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, g1b, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, g1bHandler, "A", "read-only PPS / combo PHY A / DPLL snapshot");
 // Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
 // write debug.wexpsr.addr, then read or write debug.wexpsr.val.
 static int peekAddr=0x70180;
@@ -8277,6 +8295,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_pw2);
     pwOffCall=thread_call_allocate(pwOffWork,nullptr);
     sysctl_register_oid(&sysctl__debug_wexpsr_pmc);
+    sysctl_register_oid(&sysctl__debug_wexpsr_g1b);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
     sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();
@@ -8390,6 +8409,19 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
    wrapDisplay13ReadAUX(port,0x000,r.dump000,sizeof(r.dump000));
    wrapDisplay13ReadAUX(port,0x070,r.dump070,sizeof(r.dump070));
    wrapDisplay13ReadAUX(port,0x2200,r.dump2200,sizeof(r.dump2200));
+   // G phase 1b, read-only: link rates, DSC/FEC caps, current link configuration and status, DSC enable,
+   // PSR configuration and sink power state, for planning a panel power down in sleep.
+   {
+    static const uint16_t g1bDpcd[]={0x010,0x060,0x090,0x100,0x110,0x160,0x170,0x200,0x600};
+    uint8_t out[sizeof(g1bDpcd)/sizeof(g1bDpcd[0])][20] {};
+    for(unsigned i=0;i<sizeof(g1bDpcd)/sizeof(g1bDpcd[0]);++i) {
+     out[i][0]=g1bDpcd[i]&0xFF;out[i][1]=g1bDpcd[i]>>8;
+     const uint32_t len=g1bDpcd[i]==0x600 || g1bDpcd[i]==0x090 ? 1 : 16;
+     out[i][2]=static_cast<uint8_t>(len);
+     out[i][3]=wrapDisplay13ReadAUX(port,g1bDpcd[i],out[i]+4,len) ? 1 : 0;
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXG1bDPCD",out,sizeof(out));
+   }
    e=wrapDisplay13ReadAUX(port,A::CapsAddress,display13EDPAuxBLCaps,sizeof(display13EDPAuxBLCaps));
    uint8_t bits[3] {};
    if(!e)e=wrapDisplay13ReadAUX(port,A::BitCountAddress,bits,sizeof(bits));
