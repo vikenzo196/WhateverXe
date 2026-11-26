@@ -8848,6 +8848,9 @@ static uint32_t dc6Dropped=0,dc6Aux=0,dc6Ddi=0;
 // Mode: 1 = DC6, 2 = control run (wells released and requested again, DC states never allowed).
 static int dc6Mode=0;
 static uint32_t dc6Lost=0;
+// Display core state (CDCLK_CTL, DE PLL, DBUF slices) as the sleep found it.
+constexpr uint32_t CdclkCtl=0x46000,DePll=0x46070,Dbuf1=0x45008,Dbuf2=0x44FE8;
+static uint32_t core0[4];
 // PW_A canaries (pipe A registers the DMC does not restore if PW_A loses power): PIPE_MISC, PLANE_STRIDE,
 // PLANE_SIZE, PLANE_BUF_CFG, PS_CTRL, GAMMA_MODE, DSC0/DSC1 PPS0. If any differs after the wells are back the
 // chain is not restarted (bc 0x2D) and the caller reboots.
@@ -8872,6 +8875,12 @@ static void bc(uint8_t code) {
     const int o=__atomic_load_n(&bcOfs,__ATOMIC_ACQUIRE);
     if(o<0x0E || o>0xFE)return;
     cmosWrite(static_cast<uint8_t>(o),code);cmosWrite(static_cast<uint8_t>(o+1),bcRun);
+}
+// Extra black-box bytes after the code and run number (same row): idx 2..15.
+static void bcx(unsigned idx,uint8_t v) {
+    const int o=__atomic_load_n(&bcOfs,__ATOMIC_ACQUIRE);
+    if(o<0x0E || o+static_cast<int>(idx)>0xFF || idx<2)return;
+    cmosWrite(static_cast<uint8_t>(o+static_cast<int>(idx)),v);
 }
 static char cmosText[1024];
 static int cmosHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
@@ -8961,9 +8970,13 @@ static void g5Dc6Enter() {
     const bool pipesOff=!(rd(0x71008)&(1U<<31)) && !(rd(0x72008)&(1U<<31)) && !(rd(0x73008)&(1U<<31));
     A1LOG("| DC6 arm dmc=%d pipesOff=%d pw=%08x aux=%08x ddi=%08x dcEn=%08x dcDbg=%08x dc5=%u dc6=%u ",dmcLoaded,pipesOff,rd(PwCtl),
         rd(AuxCtl2),rd(DdiCtl2),rd(DCStateEn),rd(DCStateDebug),rd(DC5Count),rd(DC6Count));
-    if((dc6Arm==1 && !dmcLoaded) || !pipesOff){bc(0x1F);return;}
+    if((dc6Arm!=2 && !dmcLoaded) || !pipesOff){bc(0x1F);return;}
     dc6Mode=dc6Arm;
     for(unsigned i=0;i<8;++i)canary0[i]=rd(Canary[i]);
+    core0[0]=rd(CdclkCtl);core0[1]=rd(DePll);core0[2]=rd(Dbuf1);core0[3]=rd(Dbuf2);
+    A1LOG("core cdclk=%08x pll=%08x dbuf=%08x/%08x fuse=%08x ",core0[0],core0[1],core0[2],core0[3],rd(FuseStatus));
+    bcx(7,static_cast<uint8_t>(core0[1]>>24));bcx(8,static_cast<uint8_t>(core0[2]>>24));bcx(9,static_cast<uint8_t>(core0[3]>>24));
+    bcx(10,static_cast<uint8_t>(rd(DCStateEn)));bcx(11,static_cast<uint8_t>(dc6Mode));
     const uint32_t sec=static_cast<uint32_t>(__atomic_load_n(&tcoSec,__ATOMIC_ACQUIRE));
     const bool armed=sec && tcoArm(sec);
     A1LOG("tco=%u/%d ",sec,armed);
@@ -8976,6 +8989,7 @@ static void g5Dc6Enter() {
     A1LOG("released=%08x pw=%08x aux=%08x ddi=%08x ",dc6Dropped,rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2));
     bc(0x13);
     if(dc6Mode==1){writeDCState(2);bc(0x14);}
+    else if(dc6Mode==3){writeDCState(1);bc(0x16);}
     else bc(0x15);
     dc6Active=true;
 }
@@ -8995,6 +9009,17 @@ static void g5Dc6Exit() {
     pwUs+=g5WaitBit(FuseStatus,1U<<26,true,10000);
     IODelay(100);
     bc(0x30);
+    // Linux reads the CDCLK and DBUF state right after leaving DC states (intel_cdclk_get_cdclk,
+    // gen9_assert_dbuf_enabled) before any other power well: wait for what the sleep had on to be back.
+    uint8_t coreTimeouts=0;
+    if((core0[1]&(1U<<31)) && g5WaitBit(DePll,1U<<30,true,10000)>=10000)coreTimeouts|=1;
+    if((core0[2]&(1U<<31)) && g5WaitBit(Dbuf1,1U<<30,true,10000)>=10000)coreTimeouts|=2;
+    if((core0[3]&(1U<<31)) && g5WaitBit(Dbuf2,1U<<30,true,10000)>=10000)coreTimeouts|=4;
+    const uint32_t core1[4]={rd(CdclkCtl),rd(DePll),rd(Dbuf1),rd(Dbuf2)};
+    bcx(2,coreTimeouts);bcx(3,static_cast<uint8_t>(core1[1]>>24));bcx(4,static_cast<uint8_t>(core1[2]>>24));
+    bcx(5,static_cast<uint8_t>(core1[3]>>24));bcx(6,static_cast<uint8_t>(core1[0]!=core0[0]));
+    IODelay(100);
+    bc(0x37);
     const uint32_t order[4]={1U<<3,1U<<11,1U<<13,1U<<15}; // PW2, PW_A, PW_B, PW_C
     const uint32_t fuse[4]={1U<<25,1U<<21,1U<<20,1U<<19};  // PG2, PG6, PG7, PG8
     uint32_t waits[6] {};
@@ -9012,6 +9037,7 @@ static void g5Dc6Exit() {
     for(auto w:waits)pwUs+=w;
     bc(0x23);
     const uint32_t dc5=rd(DC5Count),dc6=rd(DC6Count);
+    A1LOG("| core cdclk=%08x pll=%08x dbuf=%08x/%08x timeouts=%x ",core1[0],core1[1],core1[2],core1[3],coreTimeouts);
     A1LOG("| DC6 exit mode=%d dcEnWas=%08x dc5=%u dc6=%u dcEn=%08x pw=%08x aux=%08x ddi=%08x fuse=%08x wellsUs=%u waits=%u/%u/%u/%u/%u/%u ",
         dc6Mode,en,dc5,dc6,rd(DCStateEn),rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),rd(FuseStatus),pwUs,waits[0],waits[1],waits[2],waits[3],waits[4],waits[5]);
     dc6Lost=0;
@@ -9087,8 +9113,8 @@ static int a5Dc6Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *re
     int value=__atomic_load_n(&G5::dc6Arm,__ATOMIC_ACQUIRE);
     const int error=sysctl_handle_int(oidp,&value,0,req);
     if(error || !req->newptr)return error;
-    if(value<0 || value>2)return EINVAL;
-    if(value==1 && !dmcLoaded)return ENXIO;
+    if(value<0 || value>3)return EINVAL;
+    if(value!=0 && value!=2 && !dmcLoaded)return ENXIO;
     __atomic_store_n(&G5::dc6Arm,value,__ATOMIC_RELEASE);
     return 0;
 }
