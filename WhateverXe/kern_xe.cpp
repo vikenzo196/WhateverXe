@@ -8873,6 +8873,56 @@ static uint32_t dc6Lost=0;
 // Display core state (CDCLK_CTL, DE PLL, DBUF slices) as the sleep found it.
 constexpr uint32_t CdclkCtl=0x46000,DePll=0x46070,Dbuf1=0x45008,Dbuf2=0x44FE8;
 static uint32_t core0[4];
+// PW_A save/restore: what pipe A loses when PW_A is powered down (mode-2 and DC runs showed PIPE_MISC, plane, gamma
+// and DSC registers back at their defaults). Plain ranges are written back where they changed, in address order,
+// with the pipe off, skipping read-only/status registers and the LUT index/data windows; the LUTs (10-bit gamma
+// PAL_PREC, 1024 entries; pre-CSC degamma, 131 entries on display 13) go through their auto-increment windows.
+struct PwaRange { uint32_t start,dwords; };
+constexpr PwaRange PwaRanges[5]={{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,128}};
+constexpr uint32_t PwaDwords=1024+1024+128+320+128;
+static uint32_t pwaSave[PwaDwords];
+static uint32_t gammaSave[1024],degammaSave[131];
+static uint32_t pwaIndexSave[2];
+// Pipe interrupt mask/enable (GEN8_DE_PIPE_IMR/IER A-C) live in the pipe wells: Linux reprograms them after the well
+// is back (gen8_irq_power_well_post_enable); without that the donor would lose vblank and flip interrupts.
+static uint32_t pipeIrqSave[3][2];
+static uint32_t pwaWrites=0,pwaSkips=0;
+static bool pwaSkip(uint32_t r) {
+    switch(r) {
+    case 0x70000:case 0x70008:case 0x70040:case 0x70044:case 0x70048:case 0x7004C: // DSL, TRANSCONF, counters, stamps
+    case 0x4A400:case 0x4A404:case 0x4A408:case 0x4A40C:case 0x4A484:case 0x4A488:  // LUT index/data windows
+        return true;
+    }
+    if(r>=0x70000 && r<0x71000 && ((r&0xFF)==0xAC))return true;                   // PLANE_SURFLIVE (x80 planes)
+    if(r>=0x68000 && r<0x69000 && (r&0xFF)>=0x98 && (r&0xFF)<=0xA4)return true;       // scaler coefficient windows
+    return false;
+}
+static void pwaSaveAll() {
+    uint32_t k=0;
+    for(const auto &g:PwaRanges)for(uint32_t i=0;i<g.dwords;++i)pwaSave[k++]=rd(g.start+4*i);
+    pwaIndexSave[0]=rd(0x4A400);pwaIndexSave[1]=rd(0x4A484);
+    for(unsigned p=0;p<3;++p){pipeIrqSave[p][0]=rd(0x44404+0x10*p);pipeIrqSave[p][1]=rd(0x4440C+0x10*p);}
+    wr(0x4A400,1U<<15);for(auto &v:gammaSave)v=rd(0x4A404);
+    wr(0x4A484,1U<<10);for(auto &v:degammaSave)v=rd(0x4A488);
+    wr(0x4A400,pwaIndexSave[0]);wr(0x4A484,pwaIndexSave[1]);
+}
+static void pwaRestoreAll() {
+    pwaWrites=pwaSkips=0;
+    for(unsigned p=0;p<3;++p) {
+        if(rd(0x4440C+0x10*p)!=pipeIrqSave[p][1] || rd(0x44404+0x10*p)!=pipeIrqSave[p][0]) {
+            wr(0x44404+0x10*p,pipeIrqSave[p][0]);wr(0x4440C+0x10*p,pipeIrqSave[p][1]);wr(0x44408+0x10*p,0xFFFFFFFFU);++pwaWrites;
+        }
+    }
+    uint32_t k=0;
+    for(const auto &g:PwaRanges)for(uint32_t i=0;i<g.dwords;++i,++k) {
+        const uint32_t r=g.start+4*i;
+        if(pwaSkip(r)){++pwaSkips;continue;}
+        if(rd(r)!=pwaSave[k]){wr(r,pwaSave[k]);++pwaWrites;}
+    }
+    wr(0x4A400,1U<<15);for(auto v:gammaSave)wr(0x4A404,v);
+    wr(0x4A484,1U<<10);for(auto v:degammaSave)wr(0x4A488,v);
+    wr(0x4A400,pwaIndexSave[0]);wr(0x4A484,pwaIndexSave[1]);
+}
 // PW_A canaries (pipe A registers the DMC does not restore if PW_A loses power): PIPE_MISC, PLANE_STRIDE,
 // PLANE_SIZE, PLANE_BUF_CFG, PS_CTRL, GAMMA_MODE, DSC0/DSC1 PPS0. If any differs after the wells are back the
 // chain is not restarted (bc 0x2D) and the caller reboots.
@@ -8996,6 +9046,7 @@ static void g5Dc6Enter() {
     dc6Mode=dc6Arm;
     for(unsigned i=0;i<8;++i)canary0[i]=rd(Canary[i]);
     core0[0]=rd(CdclkCtl);core0[1]=rd(DePll);core0[2]=rd(Dbuf1);core0[3]=rd(Dbuf2);
+    pwaSaveAll();
     A1LOG("core cdclk=%08x pll=%08x dbuf=%08x/%08x fuse=%08x ",core0[0],core0[1],core0[2],core0[3],rd(FuseStatus));
     bcx(7,static_cast<uint8_t>(core0[1]>>24));bcx(8,static_cast<uint8_t>(core0[2]>>24));bcx(9,static_cast<uint8_t>(core0[3]>>24));
     bcx(10,static_cast<uint8_t>(rd(DCStateEn)));bcx(11,static_cast<uint8_t>(dc6Mode));
@@ -9058,12 +9109,20 @@ static void g5Dc6Exit() {
     bc(0x36);
     for(auto w:waits)pwUs+=w;
     bc(0x23);
+    pwaRestoreAll();
+    bc(0x38);
     const uint32_t dc5=rd(DC5Count),dc6=rd(DC6Count);
     A1LOG("| core cdclk=%08x pll=%08x dbuf=%08x/%08x timeouts=%x ",core1[0],core1[1],core1[2],core1[3],coreTimeouts);
     A1LOG("| DC6 exit mode=%d dcEnWas=%08x dc5=%u dc6=%u dcEn=%08x pw=%08x aux=%08x ddi=%08x fuse=%08x wellsUs=%u waits=%u/%u/%u/%u/%u/%u ",
         dc6Mode,en,dc5,dc6,rd(DCStateEn),rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),rd(FuseStatus),pwUs,waits[0],waits[1],waits[2],waits[3],waits[4],waits[5]);
+    A1LOG("restored=%u skipped=%u ",pwaWrites,pwaSkips);
     dc6Lost=0;
     for(unsigned i=0;i<8;++i){const uint32_t v=rd(Canary[i]);if(v!=canary0[i])dc6Lost|=1U<<i;A1LOG("%x=%08x>%08x ",Canary[i],canary0[i],v);}
+    {   // gamma check: first and last entries read back
+        wr(0x4A400,1U<<15);const uint32_t g0=rd(0x4A404);wr(0x4A400,(1U<<15)|1023U);const uint32_t g1=rd(0x4A404);wr(0x4A400,pwaIndexSave[0]);
+        if(g0!=gammaSave[0] || g1!=gammaSave[1023])dc6Lost|=0x100;
+        A1LOG("gamma0=%08x>%08x gamma1023=%08x>%08x ",gammaSave[0],g0,gammaSave[1023],g1);
+    }
     bc(dc6Lost ? 0x2D : 0x2C);
 }
 static void g5Hook(uint32_t phase,uint32_t reason) {
