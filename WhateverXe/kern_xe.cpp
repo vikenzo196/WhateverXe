@@ -8460,7 +8460,24 @@ static uint32_t a3WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxMs) {
     while(((rd(reg)&mask)!=0)!=set && ms<maxMs){IOSleep(1);++ms;}
     return ms;
 }
-static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false) {
+// A4 (pll=true, implies chain and cmtgOff: the ADL-P CMTG runs on the DPLL0 clock) also stops the port
+// clock and DPLL0 after the panel power off, like Linux icl_ddi_combo_disable_clock and combo_pll_disable
+// (DPCLKA_CFGCR0 DDI A clock off; DPLL0_ENABLE enable off, wait for the lock to drop, power off, wait
+// for the power state), and restarts them before the panel power on like combo_pll_enable (power on,
+// CFGCR0/CFGCR1 and the DIV0 AFC startup field as saved, enable, wait for the lock) and
+// icl_ddi_combo_enable_clock (clock select, then clock on, in separate writes).
+namespace A4 {
+constexpr uint32_t DPCLKA=0x164280,PllEnable=0x46010,Cfgcr0=0x164284,Cfgcr1=0x164288,Div0=0x164B00;
+constexpr uint32_t PllOn=1U<<31,PllLock=1U<<30,PllPower=1U<<27,PllPowerState=1U<<26,ClkOffA=1U<<10,ClkSelA=3U,AfcMask=7U<<25;
+static uint32_t runs=0;
+}
+static uint32_t a4WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxUs) {
+    uint32_t us=0;
+    while(((rd(reg)&mask)!=0)!=set && us<maxUs){IODelay(10);us+=10;}
+    return us;
+}
+static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false,bool pll=false) {
+    if(pll)chain=cmtgOff=true;
     using namespace A1;
     auto &c=display13FBPower;
     if(!map || !c.lock || map->getLength()<ShotplugDDI+4)return ENODEV;
@@ -8485,7 +8502,12 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false) {
         cmtg0=rd(A3::CmtgCtl),gb10=rd(A3::CmtgGB1),cur0=rd(A3::CurCntr),curBase0=rd(A3::CurBase),frame0=rd(A3::FrameCount);
     uint32_t planeCtl0[5] {},planeSurf0[5] {};
     for(unsigned i=0;i<5;++i){planeCtl0[i]=rd(A3::PlaneCtl[i]);planeSurf0[i]=rd(A3::PlaneSurf[i]);}
-    const bool chainOk=!chain || ((conf0&0xC0000000U)==0xC0000000U && (clk0>>28)==1);
+    const uint32_t dpclka0=rd(A4::DPCLKA),pllEn0=rd(A4::PllEnable),cfgcr00=rd(A4::Cfgcr0),cfgcr10=rd(A4::Cfgcr1),div00=rd(A4::Div0);
+    // DPLL0 must feed DDI A only: DDI A clock on from DPLL0, DDI B (combo PHY B) clock off or on another PLL.
+    const bool pllOk=!pll || ((pllEn0&(A4::PllOn|A4::PllLock|A4::PllPower|A4::PllPowerState))==(A4::PllOn|A4::PllLock|A4::PllPower|A4::PllPowerState) &&
+        !(dpclka0&A4::ClkOffA) && (dpclka0&A4::ClkSelA)==0 && ((dpclka0&(1U<<11)) || ((dpclka0>>2)&3)!=0));
+    if(pll)A1LOG("A4 run=%u dpclka=%08x pll=%08x cfgcr=%08x/%08x div0=%08x ",A4::runs,dpclka0,pllEn0,cfgcr00,cfgcr10,div00);
+    const bool chainOk=!chain || ((conf0&0xC0000000U)==0xC0000000U && (clk0>>28)==1 && pllOk);
     if(chain)A1LOG("A3 run=%u cmtgOff=%d conf=%08x clk=%08x ctl2=%08x dss=%08x/%08x cmtg=%08x gb1=%08x cur=%08x/%08x frame=%u plane1=%08x/%08x ",
         A3::runs,cmtgOff,conf0,clk0,ctl20,dss10,dss20,cmtg0,gb10,cur0,curBase0,frame0,planeCtl0[0],planeSurf0[0]);
     if(!regsOk || !sinkOk || !chainOk){A1LOG("result=precondition regs=%d sink=%d chain=%d",regsOk,sinkOk,chainOk);return EBUSY;}
@@ -8535,11 +8557,35 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false) {
     IOLockUnlock(c.lock);
     const uint32_t offWait=a2WaitPP(A2::PPOn|A2::PPSeq,0,5000);
     const uint64_t offAt=mach_absolute_time();
+    if(pll) {
+        IOLockLock(c.lock);
+        wr(A4::DPCLKA,rd(A4::DPCLKA)|A4::ClkOffA);(void)rd(A4::DPCLKA);
+        wr(A4::PllEnable,rd(A4::PllEnable)&~A4::PllOn);
+        const uint32_t unlockUs=a4WaitBit(A4::PllEnable,A4::PllLock,false,1000);
+        wr(A4::PllEnable,rd(A4::PllEnable)&~A4::PllPower);
+        const uint32_t powerOffUs=a4WaitBit(A4::PllEnable,A4::PllPowerState,false,1000);
+        const uint32_t dpclkaOff=rd(A4::DPCLKA),pllOff=rd(A4::PllEnable);
+        IOLockUnlock(c.lock);
+        A1LOG("| A4off unlock=%uus powerOff=%uus dpclka=%08x pll=%08x ",unlockUs,powerOffUs,dpclkaOff,pllOff);
+    }
     const uint32_t ppsOff=rd(A2::PPStatus);
     A1LOG("| d3=%d bufIdle=%uus offWait=%ums ppsOff=%08x t=%llums ",d3Ok,idleUs,offWait,ppsOff,a2Ms(t0));
     // 4. Stay off, then wait for the power cycle delay to expire.
     IOSleep(offMs);
     const uint32_t cycleWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPCycle|A2::PPState,0,5000);
+    if(pll) {
+        IOLockLock(c.lock);
+        wr(A4::PllEnable,rd(A4::PllEnable)|A4::PllPower);
+        const uint32_t powerOnUs=a4WaitBit(A4::PllEnable,A4::PllPowerState,true,1000);
+        const uint32_t rst0=rd(A4::Cfgcr0),rst1=rd(A4::Cfgcr1),rstDiv=rd(A4::Div0);
+        wr(A4::Cfgcr0,cfgcr00);wr(A4::Cfgcr1,cfgcr10);
+        wr(A4::Div0,(rd(A4::Div0)&~A4::AfcMask)|(div00&A4::AfcMask));(void)rd(A4::Cfgcr1);
+        wr(A4::PllEnable,rd(A4::PllEnable)|A4::PllOn);
+        const uint32_t lockUs=a4WaitBit(A4::PllEnable,A4::PllLock,true,1000);
+        const uint32_t pllOn=rd(A4::PllEnable);
+        IOLockUnlock(c.lock);
+        A1LOG("| A4on powerOn=%uus reset=%08x/%08x/%08x lock=%uus pll=%08x ",powerOnUs,rst0,rst1,rstDiv,lockUs,pllOn);
+    }
     // 5. Panel power on (display 13: DPLS unit clock gating off meanwhile).
     IOLockLock(c.lock);
     wr(A2::ClockGate,rd(A2::ClockGate)|A2::DPLSGate);
@@ -8548,6 +8594,12 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false) {
     const uint32_t onWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPState,A2::PPOn|A2::PPStateOnIdle,5000);
     const uint64_t onAt=mach_absolute_time();
     IOLockLock(c.lock);wr(A2::ClockGate,rd(A2::ClockGate)&~A2::DPLSGate);IOLockUnlock(c.lock);
+    if(pll) {
+        IOLockLock(c.lock);
+        wr(A4::DPCLKA,(rd(A4::DPCLKA)&~A4::ClkSelA)|(dpclka0&A4::ClkSelA));(void)rd(A4::DPCLKA);
+        wr(A4::DPCLKA,rd(A4::DPCLKA)&~A4::ClkOffA);(void)rd(A4::DPCLKA);
+        IOLockUnlock(c.lock);
+    }
     if(chain) {
         // A3: transcoder clock and transcoder function configuration (not enabled) before the training.
         IOLockLock(c.lock);wr(A3::TransClkSel,clk0);wr(TransDDI,trans&~(1U<<31));(void)rd(TransDDI);IOLockUnlock(c.lock);
@@ -8618,6 +8670,7 @@ static int a2Run(uint32_t offMs,bool chain=false,bool cmtgOff=false) {
         a2Ms(t0),blOk,pipeIir,sdeIir,shot,shot1,ddi1,tp1,pps1,ppc1);
     if(after){a1Hex("st200after",st1,8);A1LOG("pw600after=%02x ",pw1);a1Hex("bl720after",bl1,8);}
     const bool pipeGood=!chain || (rd(A3::TransConf)&(1U<<30));
+    if(pll)A1LOG("dpclka=%08x pll=%08x cfgcr=%08x/%08x div0=%08x ",rd(A4::DPCLKA),rd(A4::PllEnable),rd(A4::Cfgcr0),rd(A4::Cfgcr1),rd(A4::Div0));
     const bool good=ok && after && a1EQ(st1+2) && pipeGood;
     A1LOG("result=%s",good ? "ok" : "FAILED");
     return good ? 0 : EIO;
@@ -8651,6 +8704,20 @@ static int a3Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) 
     return result;
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a3, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a3Handler, "I", "N=600-5000 (+10000: CMTG off too): eDP chain off for N ms and back (G phase 2 step A3)");
+static int a4Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=static_cast<int>(A4::runs);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<600 || value>5000)return EINVAL;
+    if(!OSCompareAndSwap(0,1,&A1::busy))return EBUSY;
+    ++A4::runs;
+    const int result=a2Run(static_cast<uint32_t>(value),true,true,true);
+    IOLog("WEXG2A4 %s\n",A1::text);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXG2A4",A1::text);
+    OSCompareAndSwap(1,0,&A1::busy);
+    return result;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a4, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a4Handler, "I", "N=600-5000: eDP chain, CMTG A, DDI A clock and DPLL0 off for N ms and back (G phase 2 step A4)");
 // Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
 // write debug.wexpsr.addr, then read or write debug.wexpsr.val.
 static int peekAddr=0x70180;
@@ -8702,6 +8769,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a1log);
     sysctl_register_oid(&sysctl__debug_wexpsr_a2);
     sysctl_register_oid(&sysctl__debug_wexpsr_a3);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a4);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
     sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();
