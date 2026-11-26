@@ -8318,6 +8318,11 @@ static inline void lk(){if(!gRaw)IOLockLock(display13FBPower.lock);}
 static inline void ulk(){if(!gRaw)IOLockUnlock(display13FBPower.lock);}
 static void msl(uint32_t ms){if(!gRaw){IOSleep(ms);return;}for(uint32_t i=0;i<ms;++i)IODelay(1000);}
 namespace G5 {
+// Diagnostic: after a DC sleep keep the pipe A FIFO underrun interrupt masked (the donor logs a full watermark dump on
+// every underrun, holding the framebuffer gate until WindowServer's watchdog fires). dc6Restored: this wake follows a
+// DC sleep whose pipe A registers were written back.
+static int keepUnderrunMasked=1;
+static bool dc6Restored=false;
 constexpr uint32_t AuxCtl=0x64010,AuxData=0x64014;
 constexpr uint32_t SendBusy=1U<<31,Done=1U<<30,Timeout=1U<<28,TimeoutMax=3U<<26,RecvErr=1U<<25,SizeShift=20,SizeMask=0x1FU<<20;
 constexpr uint32_t SyncPulses=(17U<<5)|31U;
@@ -8784,7 +8789,8 @@ static int g2On() {
     const uint32_t pipeIir=rd(PipeIIR),sdeIir=rd(SDEIIR),shot=rd(ShotplugDDI);
     wr(ShotplugDDI,(shot&~0x33333333U)|(shot&0x3U));
     wr(SDEIIR,1U<<16);
-    if(!(pipeImr&(1U<<31))){wr(PipeIIR,1U<<31);wr(PipeIMR,rd(PipeIMR)&~(1U<<31));}
+    const bool keepMasked=G5::dc6Restored && __atomic_load_n(&G5::keepUnderrunMasked,__ATOMIC_ACQUIRE);
+    if(!(pipeImr&(1U<<31)) && !keepMasked){wr(PipeIIR,1U<<31);wr(PipeIMR,rd(PipeIMR)&~(1U<<31));}
     if(!(sdeImr&(1U<<16)))wr(SDEIMR,rd(SDEIMR)&~(1U<<16));
     const uint32_t ddi1=rd(DDIBuf),tp1=rd(TPCtl),pps1=rd(A2::PPStatus),ppc1=rd(A2::PPControl),shot1=rd(ShotplugDDI);
     ulk();
@@ -8878,8 +8884,9 @@ static uint32_t core0[4];
 // with the pipe off, skipping read-only/status registers and the LUT index/data windows; the LUTs (10-bit gamma
 // PAL_PREC, 1024 entries; pre-CSC degamma, 131 entries on display 13) go through their auto-increment windows.
 struct PwaRange { uint32_t start,dwords; };
-constexpr PwaRange PwaRanges[5]={{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,128}};
-constexpr uint32_t PwaDwords=1024+1024+128+320+128;
+constexpr PwaRange PwaRanges[6]={{0x60000,64},{0x70000,1024},{0x68000,1024},{0x49000,128},{0x4A000,320},{0x78000,128}};
+constexpr uint32_t PwaDwords=64+1024+1024+128+320+128;
+
 static uint32_t pwaSave[PwaDwords];
 static uint32_t gammaSave[1024],degammaSave[131];
 static uint32_t pwaIndexSave[2];
@@ -9068,8 +9075,9 @@ static void g5Dc6Enter() {
 }
 static void g5Dc6Exit() {
     using namespace G5;
+    dc6Restored=false;
     if(!dc6Active)return;
-    dc6Active=false;dc6Arm=0;
+    dc6Active=false;dc6Arm=0;dc6Restored=true;
     tcoPing();
     bc(0x21);
     const uint32_t en=rd(DCStateEn);
@@ -9199,6 +9207,24 @@ static int a5Dc6Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *re
     __atomic_store_n(&G5::dc6Arm,value,__ATOMIC_RELEASE);
     return 0;
 }
+static int dumpBase=0x70000;
+static char dumpText[256*9+64];
+static int dumpBaseHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=dumpBase;const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<0x40000 || value>0x1FFC00 || (value&3))return EINVAL;
+    dumpBase=value;return 0;
+}
+// 256 dwords from debug.wexpsr.dumpbase (read only): "addr=v,addr=v,..." for before/after comparisons.
+static int dumpHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    if(!map)return ENODEV;
+    size_t u=0;const uint32_t b=static_cast<uint32_t>(dumpBase);
+    for(uint32_t i=0;i<256 && u+20<sizeof(dumpText);++i)
+        u+=static_cast<size_t>(snprintf(dumpText+u,sizeof(dumpText)-u,"%x=%x,",b+4*i,rd(b+4*i)));
+    return sysctl_handle_string(oidp,dumpText,sizeof(dumpText),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dumpbase, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dumpBaseHandler, "I", "base of debug.wexpsr.dump");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dump, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, dumpHandler, "A", "256 display registers from dumpbase");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, cmos, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, cmosHandler, "A", "CMOS bytes 0x00-0xFF (read only)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, bcofs, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, bcOfsHandler, "I", "CMOS byte for the DC6 black box (-1 off)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, tco, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, tcoHandler, "A", "PCH TCO watchdog registers (read only)");
@@ -9263,6 +9289,8 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
+    sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+    sysctl_register_oid(&sysctl__debug_wexpsr_dump);
     sysctl_register_oid(&sysctl__debug_wexpsr_bcofs);
     sysctl_register_oid(&sysctl__debug_wexpsr_tco);
     sysctl_register_oid(&sysctl__debug_wexpsr_tcosec);
