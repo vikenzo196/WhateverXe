@@ -8279,7 +8279,7 @@ constexpr uint32_t DDIBuf=0x64000,TPCtl=0x60540,TPStatus=0x60544,TransDDI=0x6040
     PipeIMR=0x44404,PipeIIR=0x44408,SDEIMR=0xC4004,SDEIIR=0xC4008,SDEIER=0xC400C,ShotplugDDI=0xC4030;
 constexpr uint32_t BufEnable=1U<<31,BufIdle=1U<<7,TPEnable=1U<<31,TPTrain=7U<<8,TPIdleDone=1U<<25;
 constexpr uint32_t Pat1=0U<<8,Idle=2U<<8,Normal=3U<<8,Pat3=4U<<8;
-static char text[2048];
+static char text[4096];
 static size_t used=0;
 static volatile UInt32 busy=0;
 static uint32_t runs=0,lastResult=0;
@@ -8348,7 +8348,7 @@ static bool a1Attempt(unsigned attempt,uint32_t ddi0,uint32_t tp0,uint8_t level,
     A1LOG("aux=%d patOff=%d idleDone=%uus tp=%08x tps=%08x ",ok,offOk,idleDoneUs,tpEnd,tpsEnd);
     return ok && cr && eq;
 }
-static int a1Run() {
+static int a1Run(bool force) {
     using namespace A1;
     auto &c=display13FBPower;
     if(!map || !c.lock || map->getLength()<ShotplugDDI+4)return ENODEV;
@@ -8364,7 +8364,7 @@ static int a1Run() {
     const bool regsOk=(ddi0&(BufEnable|BufIdle|(7U<<1)))==(BufEnable|(3U<<1)) &&
         (tp0&(TPEnable|(1U<<27)|TPTrain))==(TPEnable|Normal) &&
         (trans&(1U<<31)) && ((trans>>27)&0xF)==1 && ((trans>>24)&7)==2;
-    const bool sinkOk=(cfg[1]&0x1F)==4 && cfg[4]==level && cfg[5]==level && cfg[6]==level && !(level&0xE4) && a1EQ(st+2);
+    const bool sinkOk=(cfg[1]&0x1F)==4 && cfg[4]==level && cfg[5]==level && cfg[6]==level && !(level&0xE4) && (force || a1EQ(st+2));
     if(!regsOk || !sinkOk){A1LOG("result=precondition regs=%d sink=%d",regsOk,sinkOk);return EBUSY;}
     const uint32_t interval=caps[0x0E]&0x7F;
     const uint32_t eqDelayMs=interval ? (interval>4 ? 16 : 4*interval) : 1;
@@ -8395,10 +8395,10 @@ static int a1Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) 
     int value=static_cast<int>(A1::runs);
     const int error=sysctl_handle_int(oidp,&value,0,req);
     if(error || !req->newptr)return error;
-    if(value!=1)return EINVAL;
+    if(value!=1 && value!=2)return EINVAL;
     if(!OSCompareAndSwap(0,1,&A1::busy))return EBUSY;
     ++A1::runs;
-    const int result=a1Run();
+    const int result=a1Run(value==2);
     A1::lastResult=static_cast<uint32_t>(result);
     IOLog("WEXG2A1 %s\n",A1::text);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXG2A1",A1::text);
@@ -8410,6 +8410,160 @@ static int a1LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *re
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a1, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a1Handler, "I", "1 retrains the eDP link (G phase 2 step A1)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a1log, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a1LogHandler, "A", "last A1 result");
+// ---- G phase 2, step A2: panel power cycle with the pipe running (runtime only, off by default) ----
+// debug.wexpsr.a2=N (600-5000) powers the eDP panel down for N ms and back up, following Linux
+// intel_disable_ddi_dp / intel_ddi_post_disable_dp / tgl_ddi_pre_enable_dp for the panel side only:
+// DPCD backlight enable off, PPS backlight off and T9, sink D3, DDI buffer and DP_TP_CTL off,
+// PPS panel power off (wait off idle), power cycle delay, PPS on with the display 13
+// SOUTH_DSPCLK_GATE_D DPLS unit workaround (wait on idle), source OUI and sink D0, sink link
+// configuration and DSC decompression as saved, link training as A1, PPS backlight on after
+// T8, then the saved Intel TCON control (0x344) and VESA backlight registers (0x721, 0x722-0x723,
+// 0x720). Transcoder, DSC engines, pipe, CMTG, PLL and clocks keep running. The first attempt
+// writes LANE_COUNT_SET and LINK_RATE_SET only (eDP 1.4 rate table, as Linux); the second also
+// writes the LINK_BW_SET value the firmware left. Pipe A underrun and PCH DDI A hotplug are masked and the
+// DDI A hotplug status is cleared before unmasking. Result in debug.wexpsr.a1log / WEXG2A2.
+namespace A2 {
+constexpr uint32_t PPStatus=0xC7200,PPControl=0xC7204,PPOnDelays=0xC7208,PPOffDelays=0xC720C,ClockGate=0xC2020;
+constexpr uint32_t PPOn=1U<<31,PPSeq=3U<<28,PPCycle=1U<<27,PPState=0xFU,PPStateOnIdle=0x8U;
+constexpr uint32_t PowerOn=1U<<0,PowerReset=1U<<1,BLC=1U<<2,ForceVdd=1U<<3,DPLSGate=1U<<29;
+static uint32_t runs=0;
+}
+static uint32_t a2WaitPP(uint32_t mask,uint32_t value,uint32_t maxMs) {
+    uint32_t ms=0;
+    while((rd(A2::PPStatus)&mask)!=value && ms<maxMs){IOSleep(5);ms+=5;}
+    return ms;
+}
+static uint64_t a2Ms(uint64_t t0) {
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-t0,&ns);return ns/1000000ULL;
+}
+static bool a2AuxRetry(bool write,uint32_t address,uint8_t *data,uint32_t length) {
+    for(unsigned i=0;i<3;++i){if(a1Aux(write,address,data,length))return true;IOSleep(1);}
+    return false;
+}
+static int a2Run(uint32_t offMs) {
+    using namespace A1;
+    auto &c=display13FBPower;
+    if(!map || !c.lock || map->getLength()<ShotplugDDI+4)return ENODEV;
+    used=0;text[0]=0;
+    const uint32_t ddi0=rd(DDIBuf),tp0=rd(TPCtl),trans=rd(TransDDI),pps0=rd(A2::PPStatus),ppc0=rd(A2::PPControl);
+    const uint32_t onDelays=rd(A2::PPOnDelays),offDelays=rd(A2::PPOffDelays);
+    A1LOG("A2 run=%u off=%ums ddi=%08x tp=%08x trans=%08x pps=%08x ppc=%08x on=%08x offd=%08x gate=%08x sdeImr=%08x shotplug=%08x ",
+        A2::runs,offMs,ddi0,tp0,trans,pps0,ppc0,onDelays,offDelays,rd(A2::ClockGate),rd(SDEIMR),rd(ShotplugDDI));
+    uint8_t caps[16] {},cfg[16] {},cfg2[16] {},dsc[16] {},oui[16] {},intel[16] {},bl[16] {},st[8] {},pw=0;
+    if(!a1Aux(false,0x000,caps,16) || !a1Aux(false,0x100,cfg,16) || !a1Aux(false,0x110,cfg2,16) || !a1Aux(false,0x160,dsc,16) ||
+       !a1Aux(false,0x300,oui,16) || !a1Aux(false,0x340,intel,16) || !a1Aux(false,0x720,bl,16) || !a1Aux(false,0x200,st,8) ||
+       !a1Aux(false,0x600,&pw,1)){A1LOG("result=aux-read-failed");return EIO;}
+    a1Hex("cfg100",cfg,16);a1Hex("cfg110",cfg2,16);a1Hex("dsc160",dsc,4);a1Hex("oui300",oui,4);a1Hex("intel340",intel,16);
+    a1Hex("bl720",bl,8);a1Hex("st200",st,8);A1LOG("pw600=%02x ",pw);
+    const uint8_t level=cfg[3];
+    const bool regsOk=(ddi0&(BufEnable|BufIdle|(7U<<1)))==(BufEnable|(3U<<1)) &&
+        (tp0&(TPEnable|(1U<<27)|TPTrain))==(TPEnable|Normal) &&
+        (trans&(1U<<31)) && ((trans>>27)&0xF)==1 && ((trans>>24)&7)==2 &&
+        (pps0&(A2::PPOn|A2::PPSeq|A2::PPState))==(A2::PPOn|A2::PPStateOnIdle) && (ppc0&(A2::PowerOn|A2::ForceVdd))==A2::PowerOn;
+    const bool sinkOk=(cfg[1]&0x1F)==4 && cfg[4]==level && cfg[5]==level && cfg[6]==level && !(level&0xE4) && a1EQ(st+2) && pw==1;
+    if(!regsOk || !sinkOk){A1LOG("result=precondition regs=%d sink=%d",regsOk,sinkOk);return EBUSY;}
+    const uint32_t interval=caps[0x0E]&0x7F;
+    const uint32_t eqDelayMs=interval ? (interval>4 ? 16 : 4*interval) : 1;
+    const uint32_t t9=(offDelays&0x1FFF)/10,t8=(onDelays&0x1FFF)/10;
+    const uint64_t t0=mach_absolute_time();
+    IOLockLock(c.lock);
+    const uint32_t pipeImr=rd(PipeIMR),sdeImr=rd(SDEIMR);
+    wr(PipeIMR,pipeImr|(1U<<31));wr(SDEIMR,sdeImr|(1U<<16));(void)rd(SDEIMR);
+    IOLockUnlock(c.lock);
+    // 1. Backlight off: DPCD enable, then the PPS backlight and T9.
+    if(bl[0]&1){uint8_t v=bl[0]&~1;a1Aux(true,0x720,&v,1);}
+    IOLockLock(c.lock);wr(A2::PPControl,rd(A2::PPControl)&~A2::BLC);(void)rd(A2::PPControl);IOLockUnlock(c.lock);
+    IOSleep(t9);
+    // 2. Sink D3, link off.
+    uint8_t d3=2;const bool d3Ok=a1Aux(true,0x600,&d3,1);
+    IOLockLock(c.lock);
+    wr(DDIBuf,ddi0&~BufEnable);
+    wr(TPCtl,tp0&~(TPEnable|TPTrain));(void)rd(TPCtl);
+    const uint32_t idleUs=a1Wait(DDIBuf,BufIdle,true,10000);
+    // 3. Panel power off.
+    wr(A2::PPControl,rd(A2::PPControl)&~(A2::PowerOn|A2::PowerReset|A2::ForceVdd|A2::BLC));(void)rd(A2::PPControl);
+    IOLockUnlock(c.lock);
+    const uint32_t offWait=a2WaitPP(A2::PPOn|A2::PPSeq,0,5000);
+    const uint64_t offAt=mach_absolute_time();
+    const uint32_t ppsOff=rd(A2::PPStatus);
+    A1LOG("| d3=%d bufIdle=%uus offWait=%ums ppsOff=%08x t=%llums ",d3Ok,idleUs,offWait,ppsOff,a2Ms(t0));
+    // 4. Stay off, then wait for the power cycle delay to expire.
+    IOSleep(offMs);
+    const uint32_t cycleWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPCycle|A2::PPState,0,5000);
+    // 5. Panel power on (display 13: DPLS unit clock gating off meanwhile).
+    IOLockLock(c.lock);
+    wr(A2::ClockGate,rd(A2::ClockGate)|A2::DPLSGate);
+    wr(A2::PPControl,(ppc0&~A2::BLC)|A2::PowerOn|(ppc0&A2::PowerReset));(void)rd(A2::PPControl);
+    IOLockUnlock(c.lock);
+    const uint32_t onWait=a2WaitPP(A2::PPOn|A2::PPSeq|A2::PPState,A2::PPOn|A2::PPStateOnIdle,5000);
+    const uint64_t onAt=mach_absolute_time();
+    IOLockLock(c.lock);wr(A2::ClockGate,rd(A2::ClockGate)&~A2::DPLSGate);IOLockUnlock(c.lock);
+    uint64_t offNs=0;absolutetime_to_nanoseconds(onAt-offAt,&offNs);
+    A1LOG("| cycleWait=%ums onWait=%ums ppsOn=%08x panelOff=%llums ",cycleWait,onWait,rd(A2::PPStatus),offNs/1000000ULL);
+    // 6. Sink back: reset values, source OUI, D0, link configuration, DSC.
+    uint8_t r000[16] {},r100[16] {},r160=0,r300[4] {},r340[16] {},r720[8] {},rpw=0;
+    const bool alive=a2AuxRetry(false,0x000,r000,16);
+    if(alive){a1Aux(false,0x100,r100,16);a1Aux(false,0x160,&r160,1);a1Aux(false,0x300,r300,3);a1Aux(false,0x340,r340,16);
+        a1Aux(false,0x720,r720,8);a1Aux(false,0x600,&rpw,1);}
+    A1LOG("| alive=%d ",alive);a1Hex("rst000",r000,16);a1Hex("rst100",r100,16);A1LOG("rst160=%02x ",r160);a1Hex("rst300",r300,3);
+    a1Hex("rst340",r340,16);a1Hex("rst720",r720,8);A1LOG("rst600=%02x ",rpw);
+    bool ouiWritten=false;
+    if((oui[0]|oui[1]|oui[2]) && memcmp(oui,r300,3)){ouiWritten=a1Aux(true,0x300,oui,3);}
+    uint8_t d0=1;const bool d0Ok=a2AuxRetry(true,0x600,&d0,1);
+    A1LOG("oui=%d d0=%d ",ouiWritten,d0Ok);
+    bool ok=false;
+    for(unsigned attempt=1;attempt<=2 && !ok;++attempt) {
+        // Attempt 1 as Linux for an eDP 1.4 rate table: LANE_COUNT_SET and LINK_RATE_SET only (LINK_BW_SET
+        // stays 0 after the power cycle); attempt 2 also writes the LINK_BW_SET value the firmware left.
+        uint8_t link[2]={cfg[0],cfg[1]},lanes=cfg[1],spread[2]={cfg[7],cfg[8]},rate=cfg2[5],enable=dsc[0];
+        bool cfgOk=a1Aux(true,0x107,spread,2);
+        cfgOk=cfgOk && (attempt==1 ? a1Aux(true,0x101,&lanes,1) : a1Aux(true,0x100,link,2));
+        cfgOk=cfgOk && a1Aux(true,0x115,&rate,1) && a1Aux(true,0x160,&enable,1);
+        A1LOG("| cfg%u=%d bw=%02x ",attempt,cfgOk,attempt==1 ? 0 : link[0]);
+        ok=cfgOk && a1Attempt(attempt,ddi0,tp0,level,eqDelayMs);
+    }
+    // 7. Backlight on after T8, then the saved TCON and VESA backlight state.
+    const uint64_t sinceOn=a2Ms(onAt);
+    if(sinceOn<t8)IOSleep(static_cast<uint32_t>(t8-sinceOn));
+    if(ouiWritten && a2Ms(onAt)<t8+30)IOSleep(30);
+    IOLockLock(c.lock);wr(A2::PPControl,ppc0);(void)rd(A2::PPControl);IOLockUnlock(c.lock);
+    bool blOk=true;
+    if(intel[4]!=r340[4]){uint8_t v=intel[4];blOk&=a1Aux(true,0x344,&v,1);}
+    {uint8_t v=bl[1];blOk&=a1Aux(true,0x721,&v,1);}
+    {uint8_t v[2]={bl[2],bl[3]};blOk&=a1Aux(true,0x722,v,2);}
+    {uint8_t v=bl[0];blOk&=a1Aux(true,0x720,&v,1);}
+    IOSleep(20);
+    IOLockLock(c.lock);
+    const uint32_t pipeIir=rd(PipeIIR),sdeIir=rd(SDEIIR),shot=rd(ShotplugDDI);
+    wr(ShotplugDDI,(shot&~0x33333333U)|(shot&0x3U));
+    wr(SDEIIR,1U<<16);
+    if(!(pipeImr&(1U<<31))){wr(PipeIIR,1U<<31);wr(PipeIMR,rd(PipeIMR)&~(1U<<31));}
+    if(!(sdeImr&(1U<<16)))wr(SDEIMR,rd(SDEIMR)&~(1U<<16));
+    const uint32_t ddi1=rd(DDIBuf),tp1=rd(TPCtl),pps1=rd(A2::PPStatus),ppc1=rd(A2::PPControl),shot1=rd(ShotplugDDI);
+    IOLockUnlock(c.lock);
+    uint8_t st1[8] {},pw1=0,bl1[8] {};
+    const bool after=a1Aux(false,0x200,st1,8) && a1Aux(false,0x600,&pw1,1) && a1Aux(false,0x720,bl1,8);
+    A1LOG("| total=%llums bl=%d pipeIir=%08x sdeIir=%08x shotplug=%08x>%08x ddi=%08x tp=%08x pps=%08x ppc=%08x ",
+        a2Ms(t0),blOk,pipeIir,sdeIir,shot,shot1,ddi1,tp1,pps1,ppc1);
+    if(after){a1Hex("st200after",st1,8);A1LOG("pw600after=%02x ",pw1);a1Hex("bl720after",bl1,8);}
+    const bool good=ok && after && a1EQ(st1+2);
+    A1LOG("result=%s",good ? "ok" : "FAILED");
+    return good ? 0 : EIO;
+}
+static int a2Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=static_cast<int>(A2::runs);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value<600 || value>5000)return EINVAL;
+    if(!OSCompareAndSwap(0,1,&A1::busy))return EBUSY;
+    ++A2::runs;
+    const int result=a2Run(static_cast<uint32_t>(value));
+    IOLog("WEXG2A2 %s\n",A1::text);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXG2A2",A1::text);
+    OSCompareAndSwap(1,0,&A1::busy);
+    return result;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a2, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a2Handler, "I", "N=600-5000: eDP panel off for N ms and back (G phase 2 step A2)");
 // Display register peek/poke for live debugging (display MMIO 0x40000-0x7FFFF only):
 // write debug.wexpsr.addr, then read or write debug.wexpsr.val.
 static int peekAddr=0x70180;
@@ -8459,6 +8613,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_g1b);
     sysctl_register_oid(&sysctl__debug_wexpsr_a1);
     sysctl_register_oid(&sysctl__debug_wexpsr_a1log);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a2);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
     sysctl_register_oid(&sysctl__debug_wexpsr_val);
     publish();
