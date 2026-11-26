@@ -9258,6 +9258,27 @@ static int pciValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
     d->configWrite32(off,static_cast<uint32_t>(value));
     return 0;
 }
+// Physical memory dword read (debug.wexpsr.physaddr, then read debug.wexpsr.physval), for SoC registers outside the GPU
+// BAR such as MCHBAR/REGBAR/IOM. Reads only; the page is mapped uncached for the access and released.
+static uint32_t physAddr=0;
+static int physAddrHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=static_cast<int>(physAddr);const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(static_cast<uint32_t>(value)&3)return EINVAL;
+    physAddr=static_cast<uint32_t>(value);return 0;
+}
+static int physValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    const uint64_t page=physAddr&~0xFFFULL;
+    IOMemoryDescriptor *md=IOMemoryDescriptor::withPhysicalAddress(page,4096,kIODirectionInOut);
+    if(!md)return ENOMEM;
+    IOMemoryMap *m=md->map(kIOMapInhibitCache);md->release();
+    if(!m)return ENOMEM;
+    int value=static_cast<int>(*reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress()+(physAddr&0xFFF)));
+    m->release();
+    return sysctl_handle_int(oidp,&value,0,req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, physaddr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, physAddrHandler, "IU", "physical address for physval");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, physval, CTLTYPE_INT|CTLFLAG_RD, nullptr, 0, physValHandler, "IU", "dword at physaddr (read only)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pcisel, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pciSelHandler, "I", "bus<<16|dev<<11|fn<<8|dword");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pcival, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pciValHandler, "I", "PCI config dword at pcisel");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, dumpbase, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, dumpBaseHandler, "I", "base of debug.wexpsr.dump");
@@ -9327,6 +9348,8 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+    sysctl_register_oid(&sysctl__debug_wexpsr_physaddr);
+    sysctl_register_oid(&sysctl__debug_wexpsr_physval);
     sysctl_register_oid(&sysctl__debug_wexpsr_pcisel);
     sysctl_register_oid(&sysctl__debug_wexpsr_pcival);
     sysctl_register_oid(&sysctl__debug_wexpsr_dump);
