@@ -8835,6 +8835,48 @@ namespace G5 {
 static int enabled=0;
 static uint32_t stat[10]; // enters, offOk, offRefused, exits, onOk, onFailed, lastOff, lastOn, lastReason, skipsBusy
 static char lastLog[6144];
+// Measurement step (one sleep only, debug.wexpsr.a5dc6=1, needs the DMC loaded with debug.wexpsr.dmc=1): after the
+// chain is down, release the driver requests of PW_C, PW_B, PW_A, PW2 (PWR_WELL_CTL2 0x45404), AUX A (0x45444) and
+// DDI A IO (0x45454) and allow DC6 (DC_STATE_EN 2), like Linux when the last display reference goes; on the way
+// out DC_STATE_EN 0, the wells requested again (PW2 first), then the chain. Pipe A registers in PW_A may be lost.
+static int dc6Arm=0;
+static bool dc6Active=false;
+constexpr uint32_t PwCtl=0x45404,AuxCtl2=0x45444,DdiCtl2=0x45454;
+constexpr uint32_t PwReqs[4]={1U<<15,1U<<13,1U<<11,1U<<3}; // PW_C, PW_B, PW_A, PW2 (state = request>>1)
+static uint32_t dc6Dropped=0,dc6Aux=0,dc6Ddi=0;
+}
+static uint32_t g5WaitBit(uint32_t reg,uint32_t mask,bool set,uint32_t maxUs) {
+    uint32_t us=0;
+    while(((rd(reg)&mask)!=0)!=set && us<maxUs){IODelay(10);us+=10;}
+    return us;
+}
+static void g5Dc6Enter() {
+    using namespace G5;
+    const bool pipesOff=!(rd(0x71008)&(1U<<31)) && !(rd(0x72008)&(1U<<31)) && !(rd(0x73008)&(1U<<31));
+    A1LOG("| DC6 arm dmc=%d pipesOff=%d pw=%08x aux=%08x ddi=%08x dcEn=%08x dcDbg=%08x dc5=%u dc6=%u ",dmcLoaded,pipesOff,rd(PwCtl),
+        rd(AuxCtl2),rd(DdiCtl2),rd(DCStateEn),rd(DCStateDebug),rd(DC5Count),rd(DC6Count));
+    if(!dmcLoaded || !pipesOff)return;
+    dc6Dropped=0;
+    for(auto req:PwReqs)if(rd(PwCtl)&req){wr(PwCtl,rd(PwCtl)&~req);dc6Dropped|=req;(void)g5WaitBit(PwCtl,req>>1,false,1000);}
+    dc6Aux=rd(AuxCtl2)&2U;if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)&~2U);(void)g5WaitBit(AuxCtl2,1U,false,1000);}
+    dc6Ddi=rd(DdiCtl2)&2U;if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)&~2U);(void)g5WaitBit(DdiCtl2,1U,false,1000);}
+    writeDCState(2);
+    dc6Active=true;
+    A1LOG("released=%08x pw=%08x aux=%08x ddi=%08x dcEn=%08x ",dc6Dropped,rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),rd(DCStateEn));
+}
+static void g5Dc6Exit() {
+    using namespace G5;
+    if(!dc6Active)return;
+    dc6Active=false;dc6Arm=0;
+    const uint32_t dc5=rd(DC5Count),dc6=rd(DC6Count),en=rd(DCStateEn);
+    writeDCState(0);
+    uint32_t pwUs=0;
+    const uint32_t order[4]={1U<<3,1U<<11,1U<<13,1U<<15}; // PW2, PW_A, PW_B, PW_C
+    for(auto req:order)if(dc6Dropped&req){wr(PwCtl,rd(PwCtl)|req);pwUs+=g5WaitBit(PwCtl,req>>1,true,10000);}
+    if(dc6Aux){wr(AuxCtl2,rd(AuxCtl2)|2U);pwUs+=g5WaitBit(AuxCtl2,1U,true,10000);}
+    if(dc6Ddi){wr(DdiCtl2,rd(DdiCtl2)|2U);pwUs+=g5WaitBit(DdiCtl2,1U,true,10000);}
+    A1LOG("| DC6 exit dcEnWas=%08x dc5=%u dc6=%u dcEn=%08x pw=%08x aux=%08x ddi=%08x wellsUs=%u dss=%08x/%08x pps78070=%08x plane1buf=%08x ",
+        en,dc5,dc6,rd(DCStateEn),rd(PwCtl),rd(AuxCtl2),rd(DdiCtl2),pwUs,rd(0x78000),rd(0x78004),rd(0x78070),rd(0x7027C));
 }
 static void g5Hook(uint32_t phase,uint32_t reason) {
     using namespace G5;
@@ -8842,14 +8884,16 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
     if(phase==0) {
         ++stat[0];
         if(!OSCompareAndSwap(0,1,&A1::busy)){++stat[9];return;}
-        gRaw=true;const int r=g2Off(true,true,true);gRaw=false;
+        gRaw=true;const int r=g2Off(true,true,true);
+        if(!r && __atomic_load_n(&dc6Arm,__ATOMIC_ACQUIRE))g5Dc6Enter();
+        gRaw=false;
         stat[6]=static_cast<uint32_t>(r);
         if(r){++stat[2];A1LOG(" | enter-refused");memcpy(lastLog,A1::text,sizeof(lastLog));OSCompareAndSwap(1,0,&A1::busy);}
         else ++stat[1];
     } else if(phase==1) {
         if(!g2s.active)return;
         ++stat[3];stat[8]=reason;
-        gRaw=true;const int r=g2On();gRaw=false;
+        gRaw=true;g5Dc6Exit();const int r=g2On();gRaw=false;
         stat[7]=static_cast<uint32_t>(r);
         if(r)++stat[5];else ++stat[4];
         A1LOG(" | wake reason=%u aux=%u/%u/%u",reason,auxXfers,auxRetries,auxFails);
@@ -8891,6 +8935,16 @@ static int a5LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *re
     return sysctl_handle_string(oidp,G5::lastLog,sizeof(G5::lastLog),req);
 }
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Handler, "I", "1: A4 chain off/on inside S0ixSleep's wait (G phase 2 step A5a)");
+static int a5Dc6Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=__atomic_load_n(&G5::dc6Arm,__ATOMIC_ACQUIRE);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=0 && value!=1)return EINVAL;
+    if(value && !dmcLoaded)return ENXIO;
+    __atomic_store_n(&G5::dc6Arm,value,__ATOMIC_RELEASE);
+    return 0;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5dc6, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Dc6Handler, "I", "1: next A5 sleep also releases PW_C/B/A/PW2, AUX A, DDI A IO and allows DC6 (one sleep)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5test, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TestHandler, "I", "N=600-5000: the A5 raw sequence from thread context");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5stat, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a5StatHandler, "A", "A5 counters");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5log, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, a5LogHandler, "A", "A5 log of the last sleep");
@@ -8948,6 +9002,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a4);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5stat);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5log);
     sysctl_register_oid(&sysctl__debug_wexpsr_addr);
