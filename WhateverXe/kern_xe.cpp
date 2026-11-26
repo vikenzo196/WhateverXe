@@ -9319,6 +9319,28 @@ static int physValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *
     m->release();
     return sysctl_handle_int(oidp,&value,0,req);
 }
+// MSR read (debug.wexpsr.msraddr, then debug.wexpsr.msrval on the current CPU through rdmsr_carefully, so a missing
+// MSR gives an error instead of #GP) for the package C-state limits (0xE2) and interrupt response time limits
+// (0x60A-0x60C, 0x633-0x635).
+int xePmRdmsrCarefully(uint32_t msr,uint32_t *lo,uint32_t *hi); // kern_xepm.cpp (kernel rdmsr_carefully, solved by Lilu)
+static uint32_t msrAddr=0xE2;
+static char msrText[64];
+static int msrAddrHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=static_cast<int>(msrAddr);const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    msrAddr=static_cast<uint32_t>(value);return 0;
+}
+static int msrValHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    uint32_t lo=0,hi=0;
+    const boolean_t ints=ml_set_interrupts_enabled(false);
+    const int bad=xePmRdmsrCarefully(msrAddr,&lo,&hi);
+    ml_set_interrupts_enabled(ints);
+    if(bad)snprintf(msrText,sizeof(msrText),"msr %x: not readable",msrAddr);
+    else snprintf(msrText,sizeof(msrText),"msr %x = %08x%08x",msrAddr,hi,lo);
+    return sysctl_handle_string(oidp,msrText,sizeof(msrText),req);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, msraddr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, msrAddrHandler, "IU", "MSR for msrval");
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, msrval, CTLTYPE_STRING|CTLFLAG_RD, nullptr, 0, msrValHandler, "A", "MSR at msraddr (read only)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, physaddr, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, physAddrHandler, "IU", "physical address for physval");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, physval, CTLTYPE_INT|CTLFLAG_RD, nullptr, 0, physValHandler, "IU", "dword at physaddr (read only)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, pcisel, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, pciSelHandler, "I", "bus<<16|dev<<11|fn<<8|dword");
@@ -9401,6 +9423,8 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+    sysctl_register_oid(&sysctl__debug_wexpsr_msraddr);
+    sysctl_register_oid(&sysctl__debug_wexpsr_msrval);
     sysctl_register_oid(&sysctl__debug_wexpsr_physaddr);
     sysctl_register_oid(&sysctl__debug_wexpsr_physval);
     sysctl_register_oid(&sysctl__debug_wexpsr_pcisel);

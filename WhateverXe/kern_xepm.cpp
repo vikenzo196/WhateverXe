@@ -247,6 +247,11 @@ static int gXpWaitPkg = -1;
 // pipe/plane/DC state when the wait starts. The MSRs are probed with rdmsr_carefully (no #GP on a missing
 // MSR) when s2idle is armed; the wait reads only those that answered.
 static mach_vm_address_t gXpRdmsrCarefully = 0;
+// For kern_xe.cpp diagnostics (debug.wexpsr.msrval): -1 if rdmsr_carefully was not found.
+int xePmRdmsrCarefully(uint32_t msr, uint32_t *lo, uint32_t *hi) {
+	if (!gXpRdmsrCarefully) return -1;
+	return reinterpret_cast<int (*)(uint32_t, uint32_t *, uint32_t *)>(gXpRdmsrCarefully)(msr, lo, hi);
+}
 static constexpr uint32_t xpResMsr[7] = {0x60D, 0x3F8, 0x3F9, 0x3FA, 0x630, 0x631, 0x632};   // PC2 PC3 PC6 PC7 PC8 PC9 PC10
 static uint32_t gXpMsrOk = 0;   // bits 0-6 xpResMsr, 8 PP1 0x641, 9 PSYS 0x64D, 10 PKG_CST_CONFIG 0xE2, 11/12 core C6/C7, 31 probed
 static uint32_t gXpResPm[7];
