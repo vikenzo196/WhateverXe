@@ -12,6 +12,7 @@
 > | `-wex-edp-keep` | keep the firmware-trained eDP link instead of retraining it |
 > | `-wex-edp-dsc` | keep the GOP's DSC / joiner configuration (needs `-wex-edp-keep`) |
 > | `-wex-edp-auxbl` | VESA DPCD AUX brightness (11-bit), with `SSDT-PNLF` |
+> | `wex-edp-auxbl-min=N` | panel level for the lowest brightness (e.g. `96` of 2047 on this OLED); the range then runs from N to the maximum, so the bottom of the slider is not near black. Adjustable at run time with `sysctl debug.wexpsr.blmin` |
 > | `-wex-edp-blank` | blank the panel for display sleep |
 > | `-wex-pm` | XE-PM: HWP rescale on hybrid P-cores, EPP 0, C-state tuning, D3 for unused PCI functions |
 > | `-wex-mtl-poshfix` | fix the TGL Metal driver's command-buffer leak (WindowServer memory growth) |
