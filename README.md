@@ -16,6 +16,9 @@
 > | `-wex-pm` | XE-PM: HWP rescale on hybrid P-cores, EPP 0, C-state tuning, D3 for unused PCI functions |
 > | `-wex-mtl-poshfix` | fix the TGL Metal driver's command-buffer leak (WindowServer memory growth) |
 > | `gfxrst=4` | skip the slow boot-image copy (about 10 s pause at the progress bar) |
+> | `-wex-s0ixsleep` | follow [S0ixSleep](https://github.com/vikenzo196/S0ixSleep)'s sleep: GT reset and display state through its wait hook |
+> | `-wex-dc5sleep` | deep display sleep with S0ixSleep: eDP chain off and display engine in DC5 during every sleep (see below) |
+> | `-wexpsrdebug` | experiment and raw-access sysctls (development only; awake DC states hang the machine) |
 >
 > **USB-C display output (DP alt mode)** works on this laptop since this fork: a Dell WD19 dock (USB-C, with an MST
 > hub) drives one external monitor, extended or mirrored, plugged at boot or hot-plugged, with the dock's USB and
@@ -28,13 +31,28 @@
 > - Type-C diagnostics: `WEXAUXTrace`, `WEXTCHooks`, `WEXTCRegs`, `WEXDisplay13TCLightUpWhy` in the registry and
 >   `wex-tcboot` / `wex-tcboot-prev` in NVRAM (boot progress of the framebuffer start). `-wex-notcdiag` disables them.
 >
+> **Deep sleep with S0ixSleep (`-wex-s0ixsleep -wex-dc5sleep`).** One minute after start the kext loads the full ADL-P
+> DMC firmware the way Linux does (main and pipe A-D programs, Wa_16015201720). In every S0ixSleep wait it then switches
+> the eDP chain off in Linux order (panel, link, pipe, DSC, CMTG, DDI clock, DPLL0), releases the display power wells and
+> lets the display engine enter DC5. On the way out the wells come back, the pipe A state that DC5 loses (pipe,
+> transcoder, DSC, DIP, scaler, CSC, gamma and degamma LUTs, interrupt masks, the DPT chicken bit) is written back and
+> the chain is brought up again. With S0ixSleep 0.1.4 and `SLEEP_L12` the package sleeps in **PC10 at about 0.3 W**
+> (PC3 and about 1.8 W before). The sleep is skipped while an external output (pipe B-D) is on. Status:
+> `sysctl debug.wexpsr.a5stat` (`onFailed` should stay 0). Awake DC5 is not supported: Apple's framebuffer touches the
+> display registers at any time.
+>
 > The fork also has:
 > - a WindowServer YUV patch, so full-screen video no longer crashes WindowServer. `-wex-ws-gva` disables it, but don't:
 >   on this machine the GVA path hangs the GPU;
 > - guards against white bands during the boot/shutdown handoff ([#189](https://github.com/b00t0x/WhateverXe/issues/189);
 >   opt out with `-wex-noplaneguard`, `-wex-noshutguard`, `-wex-noplanetrace`);
 > - GPU-reset recovery work;
-> - on-demand diagnostics (`WEXGTPower`, `sysctl debug.wexflip.arm`).
+> - on-demand diagnostics (`WEXGTPower`, `sysctl debug.wexflip.arm`);
+> - an experimental eDP PSR1 switch (`sysctl debug.wexpsr.enable`, off by default; switch it off before display or
+>   system sleep).
+>
+> The kext embeds Intel's ADL-P DMC firmware from linux-firmware (`adlp_dmc.bin`), redistributed unmodified under
+> [LICENSE.i915](LICENSE.i915).
 >
 > It has been tested only on that laptop. Binary releases: [Releases](https://github.com/vikenzo196/WhateverXe/releases).
 > Full EFI: [GalaxyBook3Ultra-Hackintosh](https://github.com/vikenzo196/GalaxyBook3Ultra-Hackintosh).
