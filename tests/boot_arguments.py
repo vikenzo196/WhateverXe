@@ -23,7 +23,7 @@ for array, expected in [('Off', '-wexoff'), ('Debug', '-wexdbg'), ('Beta', '-wex
     assert re.findall(r'"([^"]+)"', body) == [expected]
     used.add(expected)
 assert external <= used
-assert all(name.startswith('-wex') or name in external for name in used), used
+assert all(name.startswith('-wex') or name.startswith('wex-') or name in external for name in used), used
 assert not (root / 'WhateverXe/kern_boot_args.hpp').exists()
 # Keep the complete diagnostic namespace regression independent of user docs.
 names = json.loads((root / 'tests/fixtures/boot_argument_names.json').read_text())

@@ -64,22 +64,28 @@ inline uint16_t maxLevel(const Caps &caps,uint8_t count,uint8_t minimum,uint8_t 
     if(!pn || pn>16)return 0xFFFF;
     return static_cast<uint16_t>((1U<<pn)-1);
 }
-inline uint16_t level(uint32_t brightness,uint16_t max=0xFFFF) {
+// minLevel (wex-edp-auxbl-min=, debug.wexpsr.blmin): the panel level for the lowest brightness; the range is then
+// spread from minLevel to max, so the bottom of the slider still moves the panel. 0 = linear with a max/256 floor.
+inline uint16_t level(uint32_t brightness,uint16_t max=0xFFFF,uint16_t minLevel=0) {
     const uint32_t b=brightness>0xFFFF ? 0xFFFF : brightness;
+    if(minLevel) {
+        const uint32_t lo=minLevel<max ? minLevel : max;
+        return static_cast<uint16_t>(lo+(uint64_t(b)*(max-lo)+0x7FFF)/0xFFFF);
+    }
     const uint32_t floor=max>>8 ? max>>8 : 1;
     const uint32_t v=static_cast<uint32_t>((uint64_t(b)*max+0x7FFF)/0xFFFF);
     return static_cast<uint16_t>(v<floor ? floor : v);
 }
 
 // control/mode: current 0x720/0x721 as just read from the panel.
-inline Plan plan(const Caps &caps,uint8_t control,uint8_t mode,uint32_t brightness,uint16_t max=0) {
+inline Plan plan(const Caps &caps,uint8_t control,uint8_t mode,uint32_t brightness,uint16_t max=0,uint16_t minLevel=0) {
     Plan p;
     if(!caps.auxSet())return p;
     if(!max)max=caps.wide() ? 0xFFFF : 0xFF;
     p.usable=true;
     if((mode&ModeMask)!=ModeDPCD){p.writeMode=true;p.mode=static_cast<uint8_t>((mode&~ModeMask)|ModeDPCD);}
     if(caps.auxEnable() && !(control&BacklightEnable)){p.writeControl=true;p.control=static_cast<uint8_t>(control|BacklightEnable);}
-    p.value=level(brightness,max);
+    p.value=level(brightness,max,minLevel);
     if(caps.wide()){p.level[0]=static_cast<uint8_t>(p.value>>8);p.level[1]=static_cast<uint8_t>(p.value);p.levelLength=2;}
     else {p.level[0]=static_cast<uint8_t>(p.value);p.levelLength=1;}
     return p;

@@ -8045,6 +8045,13 @@ static uint64_t display13EDPAuxBLLastNs=0;
 static bool display13EDPAuxBLCapsValid=false;
 static uint8_t display13EDPAuxBLCaps[3] {};
 static uint16_t display13EDPAuxBLMax=0;
+// Panel level for the lowest brightness (wex-edp-auxbl-min=N at boot, debug.wexpsr.blmin at run time); 0 = linear.
+static volatile uint32_t display13EDPAuxBLMinLevel=0xFFFFFFFFU;   // not read yet
+static uint16_t display13EDPAuxBLMin() {
+ uint32_t v=__atomic_load_n(&display13EDPAuxBLMinLevel,__ATOMIC_ACQUIRE);
+ if(v==0xFFFFFFFFU){uint32_t a=0;if(!PE_parse_boot_argn("wex-edp-auxbl-min",&a,sizeof(a)))a=0;v=a>0xFFFF ? 0xFFFF : a;__atomic_store_n(&display13EDPAuxBLMinLevel,v,__ATOMIC_RELEASE);}
+ return static_cast<uint16_t>(v);
+}
 
 // ---- eDP PSR1 experiment (runtime only, off by default) ----
 // debug.wexpsr.enable: N>0 enables PSR1 on the kept eDP (transcoder A) for N
@@ -8056,6 +8063,8 @@ static uint16_t display13EDPAuxBLMax=0;
 // Display 12+ Linux keeps link standby off: the main link turns off in PSR and
 // the source retrains it with TPS1/TPS3 on exit (2500 us each, the safest timing).
 void xePmSetGpuMmio(volatile uint8_t *mmio);
+int display13EDPAuxBLSetMin(int value);
+int display13EDPAuxBLGetMin();
 namespace WEXPSR {
 constexpr uint32_t Ctl=0x60800,Status=0x60840,Perf=0x60844,Debug=0x60860;
 constexpr uint32_t Enable=1U<<31,KeepCtx=1U<<29,CRC=1U<<10,TP1TP3=1U<<11;
@@ -9257,6 +9266,13 @@ static int a5StatHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
 static int a5LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     return sysctl_handle_string(oidp,G5::lastLog,sizeof(G5::lastLog),req);
 }
+static int blminHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=::display13EDPAuxBLGetMin();
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    return ::display13EDPAuxBLSetMin(value);
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, blmin, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, blminHandler, "I", "eDP AUX brightness: panel level for the lowest brightness (0 = linear)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Handler, "I", "1: A4 chain off/on inside S0ixSleep's wait (G phase 2 step A5a)");
 static int a5Dc6Handler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     int value=__atomic_load_n(&G5::dc6Arm,__ATOMIC_ACQUIRE);
@@ -9485,6 +9501,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dckeep);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5stat);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5log);
+    sysctl_register_oid(&sysctl__debug_wexpsr_blmin);
     dcOffCall=thread_call_allocate(dcOffWork,nullptr);
     pwOffCall=thread_call_allocate(pwOffWork,nullptr);
     // Experiments and raw access (display, PCI config, physical memory, MSRs, CMOS black box, TCO watchdog, awake DC
@@ -9687,7 +9704,7 @@ void XE::display13EDPAuxBLApply(uint32_t brightness) {
    }
    if(!e) {
     r.control=state[0];r.mode=state[1];
-    const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness,display13EDPAuxBLMax);
+    const auto p=A::plan(A::Caps{caps[0],caps[1],caps[2]},state[0],state[1],brightness,display13EDPAuxBLMax,display13EDPAuxBLMin());
     r.maxLevel=display13EDPAuxBLMax;
     if(p.usable) {
      if(p.writeMode){uint8_t m=p.mode;e=wrapDisplay13WriteAUX(port,A::ModeAddress,&m,1);++r.modeWrites;if(!e)r.mode=m;}
@@ -9754,6 +9771,17 @@ bool XE::display13EDPAuxBrightness(void *controller,uint32_t brightness,uint32_t
  result=0;
  return true;
 }
+// debug.wexpsr.blmin: change the lowest-brightness panel level at run time and write the current brightness again.
+int display13EDPAuxBLSetMin(int value) {
+ if(value<0 || value>0xFFFF)return EINVAL;
+ __atomic_store_n(&display13EDPAuxBLMinLevel,static_cast<uint32_t>(value),__ATOMIC_RELEASE);
+ if(display13EDPAuxBLCall && display13EDPAuxBLState.calls) {
+  __atomic_store_n(&display13EDPAuxBLPending,(1ULL<<32)|display13EDPAuxBLState.brightness,__ATOMIC_RELEASE);
+  thread_call_enter(display13EDPAuxBLCall);
+ }
+ return 0;
+}
+int display13EDPAuxBLGetMin(){return display13EDPAuxBLMin();}
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
  const uint32_t before=WEXTCDiag::peek(packet),before1=WEXTCDiag::peek1(packet,length);

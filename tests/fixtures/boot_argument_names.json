@@ -175,5 +175,6 @@
   "-wex-cdclk-raise": [],
   "-wex-nopsrctl": [],
   "-wex-dc5sleep": [],
-  "-wexpsrdebug": []
+  "-wexpsrdebug": [],
+  "wex-edp-auxbl-min": []
 }

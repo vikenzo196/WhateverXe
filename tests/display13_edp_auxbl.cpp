@@ -38,6 +38,11 @@ int main() {
     assert(plan(gb,0,2,0,0x7FF).value==7);
     // Monotonic: no wrap anywhere in the range.
     for(uint32_t v=0,prev=0;v<=0xFFFF;v+=0x41){auto q=plan(gb,0,2,v,0x7FF);assert(q.value>=prev && q.value<=0x7FF);prev=q.value;}
+    // Minimum level (wex-edp-auxbl-min=96): the range runs from 96 to 2047, monotonic, never below the minimum.
+    assert(plan(gb,0,2,0,0x7FF,96).value==96 && plan(gb,0,2,0xFFFF,0x7FF,96).value==0x7FF);
+    assert(plan(gb,0,2,0x8000,0x7FF,96).value==96+976);
+    assert(plan(gb,0,2,0,0x7FF,0x1000).value==0x7FF);
+    for(uint32_t v=0,prev=0;v<=0xFFFF;v+=0x41){auto q=plan(gb,0,2,v,0x7FF,96);assert(q.value>=prev && q.value>=96 && q.value<=0x7FF);prev=q.value;}
     // Intel interface: Galaxy Book3 Ultra caps 01 57 01 00.
     assert((IntelCaps{{0x01,0x57,0x01,0x00}}.usable()));
     assert((!IntelCaps{{0x01,0x47,0x01,0x00}}.usable() && !IntelCaps{{0x01,0x57,0x00,0x00}}.usable()));
