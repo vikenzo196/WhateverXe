@@ -8870,6 +8870,8 @@ static char lastLog[6144];
 // DDI A IO (0x45454) and allow DC6 (DC_STATE_EN 2), like Linux when the last display reference goes; on the way
 // out DC_STATE_EN 0, the wells requested again (PW2 first), then the chain. Pipe A registers in PW_A may be lost.
 static int dc6Arm=0;
+static int dcKeep=0;          // debug.wexpsr.a5dckeep=1: the DC mode stays armed for every sleep (daily use)
+static uint32_t skipsOtherPipes=0;
 static bool dc6Active=false;
 constexpr uint32_t PwCtl=0x45404,AuxCtl2=0x45444,DdiCtl2=0x45454;
 constexpr uint32_t PwReqs[4]={1U<<15,1U<<13,1U<<11,1U<<3}; // PW_C, PW_B, PW_A, PW2 (state = request>>1)
@@ -9125,7 +9127,8 @@ static void g5Dc6Exit() {
     using namespace G5;
     dc6Restored=false;
     if(!dc6Active)return;
-    dc6Active=false;dc6Arm=0;dc6Restored=true;
+    dc6Active=false;dc6Restored=true;
+    if(!__atomic_load_n(&dcKeep,__ATOMIC_ACQUIRE))dc6Arm=0;
     tcoPing();
     bc(0x21);
     const uint32_t en=rd(DCStateEn);
@@ -9186,6 +9189,8 @@ static void g5Hook(uint32_t phase,uint32_t reason) {
     if(!__atomic_load_n(&enabled,__ATOMIC_ACQUIRE) || !map)return;
     if(phase==0) {
         ++stat[0];
+        // An external output (pipe B/C/D lit): leave the whole display path alone for this sleep.
+        if((rd(0x71008)|rd(0x72008)|rd(0x73008))&(1U<<31)){++skipsOtherPipes;return;}
         if(!OSCompareAndSwap(0,1,&A1::busy)){++stat[9];return;}
         ++bcRun;bc(0x10);
         gRaw=true;const int r=g2Off(true,true,true);
@@ -9237,11 +9242,11 @@ static int a5TestHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
     OSCompareAndSwap(1,0,&A1::busy);
     return result;
 }
-static char g5StatText[256];
+static char g5StatText[384];
 static int a5StatHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     using namespace G5;
-    snprintf(g5StatText,sizeof(g5StatText),"enabled=%d enters=%u offOk=%u offRefused=%u exits=%u onOk=%u onFailed=%u lastOff=%u lastOn=%u reason=%u busy=%u active=%d aux=%u/%u/%u",
-        enabled,stat[0],stat[1],stat[2],stat[3],stat[4],stat[5],stat[6],stat[7],stat[8],stat[9],g2s.active,auxXfers,auxRetries,auxFails);
+    snprintf(g5StatText,sizeof(g5StatText),"enabled=%d enters=%u offOk=%u offRefused=%u exits=%u onOk=%u onFailed=%u lastOff=%u lastOn=%u reason=%u busy=%u active=%d aux=%u/%u/%u dc=%d keep=%d otherPipes=%u",
+        enabled,stat[0],stat[1],stat[2],stat[3],stat[4],stat[5],stat[6],stat[7],stat[8],stat[9],g2s.active,auxXfers,auxRetries,auxFails,dc6Arm,dcKeep,skipsOtherPipes);
     return sysctl_handle_string(oidp,g5StatText,sizeof(g5StatText),req);
 }
 static int a5LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
@@ -9405,6 +9410,15 @@ static int a5TcssHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
     __atomic_store_n(&tcssArm,value,__ATOMIC_RELEASE);
     return 0;
 }
+static int a5DcKeepHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
+    int value=__atomic_load_n(&G5::dcKeep,__ATOMIC_ACQUIRE);
+    const int error=sysctl_handle_int(oidp,&value,0,req);
+    if(error || !req->newptr)return error;
+    if(value!=0 && value!=1)return EINVAL;
+    __atomic_store_n(&G5::dcKeep,value,__ATOMIC_RELEASE);
+    return 0;
+}
+SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5dckeep, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5DcKeepHandler, "I", "1: keep the a5dc6 mode armed for every sleep");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5tcss, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TcssHandler, "I", "1: TCSS D3cold (IOM TD3C) inside the A5 sleep");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5dc6, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5Dc6Handler, "I", "1: next A5 sleep also releases PW_C/B/A/PW2, AUX A, DDI A IO and allows DC6 (one sleep)");
 SYSCTL_PROC(_debug_wexpsr, OID_AUTO, a5test, CTLTYPE_INT|CTLFLAG_RW, nullptr, 0, a5TestHandler, "I", "N=600-5000: the A5 raw sequence from thread context");
@@ -9466,6 +9480,7 @@ static void install(IOMemoryMap *m) {
     sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
+    sysctl_register_oid(&sysctl__debug_wexpsr_a5dckeep);
     sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
     sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
     sysctl_register_oid(&sysctl__debug_wexpsr_coreres);
