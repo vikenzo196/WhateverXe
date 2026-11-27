@@ -8123,11 +8123,15 @@ static void writeDCState(uint32_t state) {
         else if(rereads++>5)break;
     }
 }
+static int dmcLoad();
 static int dmcHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     int value=dmcLoaded?1:0;
     const int error=sysctl_handle_int(oidp,&value,0,req);
     if(error || !req->newptr)return error;
     if(value!=1)return EINVAL;
+    return dmcLoad();
+}
+static int dmcLoad() {
     if(!map || !lock)return ENODEV;
     IOLockLock(lock);
     if(!dmcLoaded) {
@@ -9243,10 +9247,11 @@ static int a5TestHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *r
     return result;
 }
 static char g5StatText[384];
+static uint32_t dc5Armed=0;   // 1 armed by -wex-dc5sleep, 2 DMC load failed (DC5 sleep not armed)
 static int a5StatHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
     using namespace G5;
-    snprintf(g5StatText,sizeof(g5StatText),"enabled=%d enters=%u offOk=%u offRefused=%u exits=%u onOk=%u onFailed=%u lastOff=%u lastOn=%u reason=%u busy=%u active=%d aux=%u/%u/%u dc=%d keep=%d otherPipes=%u",
-        enabled,stat[0],stat[1],stat[2],stat[3],stat[4],stat[5],stat[6],stat[7],stat[8],stat[9],g2s.active,auxXfers,auxRetries,auxFails,dc6Arm,dcKeep,skipsOtherPipes);
+    snprintf(g5StatText,sizeof(g5StatText),"enabled=%d enters=%u offOk=%u offRefused=%u exits=%u onOk=%u onFailed=%u lastOff=%u lastOn=%u reason=%u busy=%u active=%d aux=%u/%u/%u dc=%d keep=%d otherPipes=%u bootarg=%u",
+        enabled,stat[0],stat[1],stat[2],stat[3],stat[4],stat[5],stat[6],stat[7],stat[8],stat[9],g2s.active,auxXfers,auxRetries,auxFails,dc6Arm,dcKeep,skipsOtherPipes,dc5Armed);
     return sysctl_handle_string(oidp,g5StatText,sizeof(g5StatText),req);
 }
 static int a5LogHandler(struct sysctl_oid *oidp,void *,int,struct sysctl_req *req) {
@@ -9454,51 +9459,71 @@ static void snapshot(const char *key) {
     IORegistryEntry::getRegistryRoot()->setProperty(key,v,sizeof(v));
 }
 static void offWork(thread_call_param_t,thread_call_param_t){XE::edpPSRDisableTimed();}
+static thread_call_t dc5ArmCall=nullptr;
+static void dc5ArmWork(thread_call_param_t,thread_call_param_t) {
+    if(dmcLoad()!=0){dc5Armed=2;return;}
+    __atomic_store_n(&G5::dcKeep,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&G5::dc6Arm,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&G5::enabled,1,__ATOMIC_RELEASE);
+    dc5Armed=1;
+}
 static void install(IOMemoryMap *m) {
     if(m)xePmSetGpuMmio(reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress()));
     if(lock || !m || checkKernelArgument("-wex-nopsrctl"))return;
     lock=IOLockAlloc();offCall=thread_call_allocate(offWork,nullptr);
     if(!lock || !offCall)return;
     map=m;map->retain();
+    // Public: PSR1 switch, read-only diagnostics, DMC load and the DC5 sleep (a5, a5dc6, a5dckeep, a5stat, a5log).
     sysctl_register_oid(&sysctl__debug_wexpsr);
     sysctl_register_oid(&sysctl__debug_wexpsr_enable);
     sysctl_register_oid(&sysctl__debug_wexpsr_status);
     sysctl_register_oid(&sysctl__debug_wexpsr_pm);
-    sysctl_register_oid(&sysctl__debug_wexpsr_dmc);
-    sysctl_register_oid(&sysctl__debug_wexpsr_dc);
-    dcOffCall=thread_call_allocate(dcOffWork,nullptr);
-    sysctl_register_oid(&sysctl__debug_wexpsr_pw2);
-    pwOffCall=thread_call_allocate(pwOffWork,nullptr);
     sysctl_register_oid(&sysctl__debug_wexpsr_pmc);
-    sysctl_register_oid(&sysctl__debug_wexpsr_g1b);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a1);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a1log);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a2);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a3);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a4);
+    sysctl_register_oid(&sysctl__debug_wexpsr_dmc);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dc6);
-    sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5dckeep);
-    sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
-    sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
-    sysctl_register_oid(&sysctl__debug_wexpsr_coreres);
-    sysctl_register_oid(&sysctl__debug_wexpsr_irtl);
-    sysctl_register_oid(&sysctl__debug_wexpsr_msraddr);
-    sysctl_register_oid(&sysctl__debug_wexpsr_msrval);
-    sysctl_register_oid(&sysctl__debug_wexpsr_physaddr);
-    sysctl_register_oid(&sysctl__debug_wexpsr_physval);
-    sysctl_register_oid(&sysctl__debug_wexpsr_pcisel);
-    sysctl_register_oid(&sysctl__debug_wexpsr_pcival);
-    sysctl_register_oid(&sysctl__debug_wexpsr_dump);
-    sysctl_register_oid(&sysctl__debug_wexpsr_bcofs);
-    sysctl_register_oid(&sysctl__debug_wexpsr_tco);
-    sysctl_register_oid(&sysctl__debug_wexpsr_tcosec);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5stat);
     sysctl_register_oid(&sysctl__debug_wexpsr_a5log);
-    sysctl_register_oid(&sysctl__debug_wexpsr_addr);
-    sysctl_register_oid(&sysctl__debug_wexpsr_val);
+    dcOffCall=thread_call_allocate(dcOffWork,nullptr);
+    pwOffCall=thread_call_allocate(pwOffWork,nullptr);
+    // Experiments and raw access (display, PCI config, physical memory, MSRs, CMOS black box, TCO watchdog, awake DC
+    // states, the step-by-step eDP chain tests): only with -wexpsrdebug. Awake DC5 and the PW2 release hung the machine.
+    if(checkKernelArgument("-wexpsrdebug")) {
+        sysctl_register_oid(&sysctl__debug_wexpsr_dc);
+        sysctl_register_oid(&sysctl__debug_wexpsr_pw2);
+        sysctl_register_oid(&sysctl__debug_wexpsr_g1b);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a1);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a1log);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a2);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a3);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a4);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a5test);
+        sysctl_register_oid(&sysctl__debug_wexpsr_a5tcss);
+        sysctl_register_oid(&sysctl__debug_wexpsr_cmos);
+        sysctl_register_oid(&sysctl__debug_wexpsr_dumpbase);
+        sysctl_register_oid(&sysctl__debug_wexpsr_coreres);
+        sysctl_register_oid(&sysctl__debug_wexpsr_irtl);
+        sysctl_register_oid(&sysctl__debug_wexpsr_msraddr);
+        sysctl_register_oid(&sysctl__debug_wexpsr_msrval);
+        sysctl_register_oid(&sysctl__debug_wexpsr_physaddr);
+        sysctl_register_oid(&sysctl__debug_wexpsr_physval);
+        sysctl_register_oid(&sysctl__debug_wexpsr_pcisel);
+        sysctl_register_oid(&sysctl__debug_wexpsr_pcival);
+        sysctl_register_oid(&sysctl__debug_wexpsr_dump);
+        sysctl_register_oid(&sysctl__debug_wexpsr_bcofs);
+        sysctl_register_oid(&sysctl__debug_wexpsr_tco);
+        sysctl_register_oid(&sysctl__debug_wexpsr_tcosec);
+        sysctl_register_oid(&sysctl__debug_wexpsr_addr);
+        sysctl_register_oid(&sysctl__debug_wexpsr_val);
+    }
+    // -wex-dc5sleep: arm the DC5 sleep by itself one minute after start (what the com.vik.dc5sleep daemon did):
+    // full DMC load, eDP chain off in every S0ixSleep wait, PW_A-C/PW2 released and DC5 allowed, kept armed.
+    if(checkKernelArgument("-wex-dc5sleep") && (dc5ArmCall=thread_call_allocate(dc5ArmWork,nullptr))) {
+        uint64_t deadline;
+        clock_interval_to_deadline(60,kSecondScale,&deadline);
+        thread_call_enter_delayed(dc5ArmCall,deadline);
+    }
     publish();
 }
 }
