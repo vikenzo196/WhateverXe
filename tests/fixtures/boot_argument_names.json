@@ -173,5 +173,7 @@
   "-wex-tc-mst": [],
   "-wex-cdclk-stop": [],
   "-wex-cdclk-raise": [],
-  "-wex-nopsrctl": []
+  "-wex-nopsrctl": [],
+  "-wex-dc5sleep": [],
+  "-wexpsrdebug": []
 }
